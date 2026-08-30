@@ -1,4 +1,4 @@
-name: Render and deploy Quarto site
+name: Deploy site to GitHub Pages
 
 on:
   push:
@@ -21,14 +21,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Set up Quarto
-        uses: quarto-dev/quarto-actions/setup@v2
-
-      - name: Render Quarto project
-        uses: quarto-dev/quarto-actions/render@v2
-
-      - name: Add .nojekyll
-        run: touch _site/.nojekyll
+      - name: Assemble site
+        run: |
+          mkdir -p _site/chapter _site/practical
+          cp index.html _site/
+          cp chapter/linear_regression_health_medicine.html _site/chapter/
+          cp practical/mssm_linear_regression_practical.html _site/practical/
+          touch _site/.nojekyll
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3

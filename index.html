@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Linear Regression in Health and Medicine</title>
+<meta name="description" content="Lecture note and practical session on linear regression for postgraduate students in public health and epidemiology.">
+<style>
+  :root{
+    --bg:#ffffff; --fg:#1f2328; --muted:#5b6671; --line:#e3e6ea;
+    --card:#fbfcfd; --accent:#2c6e9b; --accent-fg:#ffffff;
+    --notice-bg:#fdf7e8; --notice-line:#e8d9a8; --notice-fg:#5c4a12;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#14181c; --fg:#e6e9ec; --muted:#9aa5b0; --line:#2a3138;
+      --card:#1b2026; --accent:#6db3dd; --accent-fg:#0f1418;
+      --notice-bg:#231f14; --notice-line:#4a4128; --notice-fg:#e0cf9a;
+    }
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  }
+  .wrap{max-width:760px; margin:0 auto; padding:56px 24px 72px}
+  header{border-bottom:1px solid var(--line); padding-bottom:28px; margin-bottom:36px}
+  h1{font-size:1.95rem; line-height:1.25; margin:0 0 10px; letter-spacing:-.015em}
+  .byline{margin:0; color:var(--muted); font-size:.95rem}
+  .byline .aff{display:block; margin-top:2px}
+  .intro{margin:22px 0 0; color:var(--muted)}
+  section.item{
+    border:1px solid var(--line); border-radius:10px; background:var(--card);
+    padding:22px 24px; margin-bottom:20px;
+  }
+  section.item h2{font-size:1.15rem; margin:0 0 4px; letter-spacing:-.01em}
+  section.item .sub{margin:0 0 12px; color:var(--muted); font-size:.9rem}
+  section.item p.desc{margin:0 0 18px; font-size:.95rem}
+  .links{display:flex; flex-wrap:wrap; gap:10px; align-items:center}
+  a.btn{
+    display:inline-block; text-decoration:none; font-size:.9rem; font-weight:500;
+    padding:8px 16px; border-radius:6px; border:1px solid var(--accent);
+    background:var(--accent); color:var(--accent-fg);
+  }
+  a.btn.ghost{background:transparent; color:var(--accent)}
+  a.btn:hover{opacity:.85}
+  a.plain{color:var(--accent); font-size:.9rem}
+  .notice{
+    border:1px solid var(--notice-line); background:var(--notice-bg); color:var(--notice-fg);
+    border-radius:10px; padding:16px 20px; font-size:.88rem; line-height:1.6; margin-top:36px;
+  }
+  .notice strong{font-weight:600}
+  footer{
+    margin-top:36px; padding-top:20px; border-top:1px solid var(--line);
+    color:var(--muted); font-size:.85rem;
+  }
+  footer a{color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Linear Regression in Health and Medicine</h1>
+    <p class="byline">
+      Kamarul Imran Musa
+      <span class="aff">School of Medical Sciences, Universiti Sains Malaysia</span>
+    </p>
+    <p class="intro">
+      Course materials for the DrPH programme and other postgraduate students in public health and
+      epidemiology. The lecture note develops the method; the practical shows the R code that carries
+      it out. Both are built on the same MSSM fasting blood sugar dataset and report the same models.
+    </p>
+  </header>
+
+  <section class="item">
+    <h2>Lecture Note</h2>
+    <p class="sub">Linear Regression Analysis in Health and Medicine</p>
+    <p class="desc">
+      The chapter. Covers simple and multiple linear regression, the LINE conditions, dummy variables
+      and categorical covariates, confounding, interaction, transformation and multicollinearity, model
+      comparison, and residual diagnostics. Code is hidden so the argument stays in view.
+    </p>
+    <div class="links">
+      <a class="btn" href="chapter/linear_regression_health_medicine.html">Read the lecture note</a>
+      <a class="btn ghost" href="https://github.com/drkamarul/linear_regression_2026/blob/main/chapter/linear_regression_health_medicine.qmd">View source (.qmd)</a>
+    </div>
+  </section>
+
+  <section class="item">
+    <h2>Practical Session</h2>
+    <p class="sub">Linear Regression in R &mdash; the REAAAPP workflow</p>
+    <p class="desc">
+      The hands-on companion, organised as Prepare, Read, Explore, Assume, Apply, Assess, Present,
+      Publish. Every step is shown with the R that produces it, using the tidyverse. Same data and
+      same models as the lecture note.
+    </p>
+    <div class="links">
+      <a class="btn" href="practical/mssm_linear_regression_practical.html">Open the practical</a>
+      <a class="btn ghost" href="https://github.com/drkamarul/linear_regression_2026/blob/main/practical/mssm_linear_regression_practical.qmd">View source (.qmd)</a>
+    </div>
+    <p style="margin:14px 0 0">
+      <a class="plain" href="https://github.com/drkamarul/linear_regression_2026/blob/main/practical/references.bib">references.bib</a>
+      <span style="color:var(--muted); font-size:.9rem">&nbsp;&mdash; bibliography used by the practical</span>
+    </p>
+  </section>
+
+  <div class="notice">
+    <strong>Teaching materials.</strong> These documents are prepared for teaching. The analyses use
+    data from the Metabolic Syndrome Study in Malaysia (MSSM) and are presented to illustrate method,
+    not to report study findings; they must not be cited as results. The <code>.qmd</code> source files
+    are provided for reading and reference. The dataset is <strong>not</strong> distributed with them
+    &mdash; students receive the file in class or via eLearn and place it at
+    <code>dataset/mssm_fasting_blood_sugar.xlsx</code> before re-rendering.
+  </div>
+
+  <footer>
+    Source repository:
+    <a href="https://github.com/drkamarul/linear_regression_2026">github.com/drkamarul/linear_regression_2026</a>
+  </footer>
+
+</div>
+</body>
+</html>
