@@ -1,0 +1,34 @@
+# Data (provided in class / eLearn, not on GitHub)
+dataset/
+
+# Quarto / R build artefacts
+_site/
+.quarto/
+*.Rhistory
+*.RData
+.Rproj.user/
+
+# Authoring files (not for students)
+CLAUDE.md
+implementation_plan.md
+contents.docx
+old_version_lecture_notes/
+instructions_for_practical_session_note.md
+scratch_check.R
+
+# Practical-folder copies of authoring files
+practical/CLAUDE.md
+practical/implementation_plan.md
+
+# Companion folders for non-self-contained HTML (OneDrive mangles *_files)
+*_files/
+*__iles/
+*__iles-*/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.cursor/
+
+/.quarto/

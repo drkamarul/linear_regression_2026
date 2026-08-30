@@ -1,0 +1,16 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - index.qmd
+  resources:
+    - chapter/linear_regression_health_medicine.html
+    - practical/mssm_linear_regression_practical.html
+
+website:
+  title: "Linear Regression 2026"
+  navbar: false
+
+format:
+  html:
+    theme: cosmo

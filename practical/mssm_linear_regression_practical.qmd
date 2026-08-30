@@ -1,0 +1,1808 @@
+---
+title: "Linear Regression in R: A Practical Session"
+subtitle: "The REAAAPP workflow applied to the Metabolic Syndrome Study in Malaysia"
+author:
+  - name: Kamarul Imran Musa
+    affiliations:
+      - name: School of Medical Sciences, Universiti Sains Malaysia
+date: last-modified
+date-format: "D MMMM YYYY"
+format:
+  html:
+    theme: cosmo
+    highlight-style: github
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    code-copy: true
+    code-overflow: wrap
+    embed-resources: true
+    fig-width: 7
+    fig-height: 4.5
+    fig-align: center
+    tbl-cap-location: top
+bibliography: references.bib
+link-citations: true
+execute:
+  echo: true
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    dev: "png"
+    dpi: 150
+    comment: "#>"
+---
+
+# About this practical {#sec-about}
+
+This document is the hands-on companion to the chapter *Linear Regression Analysis in Health and Medicine*. The chapter develops the theory and hides the code; this practical shows the code and keeps the theory to the minimum needed to justify each step. Where a concept needs more than a sentence, the chapter is the place to go.
+
+It is written for postgraduate students in public health and epidemiology who already use R at a basic level — you can install a package, run a script and read a data frame — and who now want to carry out a linear regression analysis properly, from raw file to reportable table.
+
+## The REAAAPP workflow
+
+Every analysis in this document follows **REAAAPP**, the workflow used in our teaching. The value of a named workflow is that it forces the unglamorous steps — exploring the data, stating the assumptions, assessing the fitted model — to happen *before* the results are written up, rather than being retrofitted when a reviewer asks.
+
+| Step | Stands for | What you do |
+|:---|:---|:-------------|
+| **Preparation** | Prepare | Load the packages you will need |
+| **R** | Read | Read the data into R and make the column names clean |
+| **E** | Explore | Plot and tabulate. Flag anything suspicious — do not act on it yet |
+| **A** | Assume | State the distributional assumption the method requires |
+| **A** | Apply | Fit the models: simple, then multiple, then interaction |
+| **A** | Assess | Check the fitted model against its assumptions, look for what the model left out, and list the outliers and influential points |
+| **P** | Present | Produce the tables and figures a reader will actually see, including a sensitivity fit |
+| **P** | Publish | Put the document and the code where others can reach them |
+
+: The REAAAPP workflow {tbl-colwidths="[12,15,73]"}
+
+## Why tidy principles
+
+Three habits carry this entire document, and they are worth naming before you meet them:
+
+1. **Tidy data.** One row per observation, one column per variable. The MSSM data already arrives in this shape, which is why almost no reshaping is needed.
+2. **Verbs that return data frames.** `filter()`, `mutate()`, `select()`, `summarise()` all take a data frame and give one back, so they compose with the pipe (`|>`) and can be read left to right as a sentence.
+3. **Tidy model output.** A fitted `lm` object is a list, not a table — awkward to filter, sort or plot. `broom::tidy()` turns it into a data frame with one row per coefficient, and `broom::glance()` gives one row per model. Once model output is rectangular, you can run eighteen regressions and handle the results with the same verbs you use on the raw data. Section [-@sec-slr] does exactly that.
+
+# Preparation {#sec-prep}
+
+`pacman::p_load()` installs a package if it is missing and loads it if it is not, so a colleague can run this document without hunting through error messages.
+
+```{r}
+#| label: setup-packages
+
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+pacman::p_load(
+  tidyverse, # dplyr, ggplot2, tidyr, purrr, forcats, stringr
+  haven, # readers for SPSS, Stata and SAS files
+  here, # file paths that do not break when the working directory moves
+  gtsummary, # publication-ready summary and regression tables
+  DT, # interactive HTML tables
+  readxl, # reader for Excel files
+  janitor, # clean_names() and other data-cleaning helpers
+  broom, # tidy(), glance() and augment() for model output
+  car, # vif()
+  lmtest, # bptest()
+  emmeans, # estimated marginal means and simple slopes
+  patchwork, # combine ggplot objects into panels
+  knitr # kable()
+)
+```
+
+`haven` is part of the standard workflow because health data so often arrives as `.sav` or `.dta`. This particular dataset is an Excel workbook, so `readxl::read_excel()` does the reading; `haven` is loaded here only so that the habit stays intact.
+
+A few global settings, so that every plot and table in the document looks the same:
+
+```{r}
+#| label: setup-options
+
+theme_set(theme_minimal(base_size = 11))
+theme_gtsummary_compact()
+set.seed(2026)
+
+# One p-value format for every hand-built table in this document. Rounding a
+# p-value of 1e-50 to three decimals would print 0.000, which is never correct.
+fmt_p <- function(p) {
+  ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+}
+
+# here::i_am() tells the here package which file it is looking at, so that
+# here() resolves to the project root rather than to the practical/ folder.
+here::i_am("practical/mssm_linear_regression_practical.qmd")
+```
+
+# R — Read the data {#sec-read}
+
+## Reading the file
+
+The data come from the **Metabolic Syndrome Study in Malaysia (MSSM)**, a cross-sectional study of adults. The outcome throughout is **fasting blood sugar in mmol/L**.
+
+```{r}
+#| label: read-raw
+
+raw <- read_excel(here::here("dataset", "mssm_fasting_blood_sugar.xlsx"))
+
+dim(raw)
+```
+
+## Cleaning the column names
+
+Raw column names in health datasets are rarely usable. This file mixes capitalisation, spaces, brackets and units:
+
+```{r}
+#| label: names-before
+
+names(raw)[c(3, 8, 12, 20)]
+```
+
+A name containing a space or a bracket has to be back-quoted every time you use it, which is a permanent source of typing errors. `janitor::clean_names()` converts every name to lower-case snake case in one call. **Do this immediately after reading, before anything else touches the data.**
+
+```{r}
+#| label: names-after
+
+raw <- clean_names(raw)
+names(raw)[c(3, 8, 12, 20)]
+```
+
+## Deriving, recoding and selecting
+
+Now one pipeline does the rest of the preparation. Read it top to bottom as a sequence of instructions:
+
+```{r}
+#| label: prepare-data
+
+dat <- raw |>
+  # 1. derive the two anthropometric indices that are not in the file
+  mutate(
+    bmi = weight_kg / (height_m^2), # kg/m^2
+    whr = waist_cm / hip_circum_cm # unitless
+  ) |>
+  # 2. the categorical variables arrive as character; regression needs factors
+  mutate(across(c(ruralurban, malefemale, race, marital, hx_dm2), as.factor)) |>
+  # 3. set the reference level of each factor explicitly, never by accident
+  mutate(
+    race = fct_relevel(race, "malay"),
+    ruralurban = fct_relevel(ruralurban, "rural"),
+    hx_dm2 = fct_relevel(hx_dm2, "no"),
+    malefemale = fct_relevel(malefemale, "female"),
+    marital = fct_relevel(marital, "married")
+  ) |>
+  # 4. give the outcome a short name
+  rename(fbs = fasting_blood_sugar) |>
+  # 5. keep only what the analysis needs
+  select(
+    fbs,
+    age,
+    height_m,
+    weight_kg,
+    waist_cm,
+    hip_circum_cm,
+    neck_circum_cm,
+    bmi,
+    whr,
+    sbp1,
+    dbp1,
+    total_bilirubin,
+    total_cholesterol,
+    fasting_tg,
+    ruralurban,
+    malefemale,
+    race,
+    marital,
+    hx_dm2
+  )
+
+glimpse(dat)
+```
+
+Three points deserve emphasis, because each is a common source of a wrong answer later.
+
+**Derived variables are computed once, in the data pipeline, not inside the model formula.** Body mass index and waist–hip ratio are
+
+$$\text{BMI} = \frac{\text{weight (kg)}}{[\text{height (m)}]^2}, \qquad \text{WHR} = \frac{\text{waist (cm)}}{\text{hip (cm)}}.$$
+
+Computing them here means every table, plot and model uses the same definition.
+
+**Character columns must become factors.** `lm()` will coerce a character vector for you, but it will choose the reference level alphabetically and silently.
+
+**Reference levels are a modelling decision, not a default.** Every coefficient for a categorical variable is a comparison *against the reference level*, so the reference determines what the numbers mean. Here Malay is the reference ethnicity because it is the largest group, rural is the reference for residence, and "no" is the reference for a history of type 2 diabetes so that the coefficient reads as the effect of *having* a history.
+
+```{r}
+#| label: check-reference-levels
+
+dat |>
+  select(where(is.factor)) |>
+  map(levels)
+```
+
+The first level listed for each variable is its reference.
+
+## A first look at the data
+
+```{r}
+#| label: dt-preview
+
+dat |>
+  slice_head(n = 100) |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  datatable(
+    caption = "Table 1. First 100 rows of the analysis dataset (interactive: sort and search).",
+    rownames = FALSE,
+    options = list(pageLength = 5, scrollX = TRUE)
+  )
+```
+
+```{r}
+#| label: codebook
+
+codebook <- tribble(
+  ~Variable           , ~Description                            , ~Unit                              ,
+  "fbs"               , "Fasting blood sugar (outcome)"         , "mmol/L"                           ,
+  "age"               , "Age"                                   , "years"                            ,
+  "height_m"          , "Height"                                , "m"                                ,
+  "weight_kg"         , "Weight"                                , "kg"                               ,
+  "waist_cm"          , "Waist circumference"                   , "cm"                               ,
+  "hip_circum_cm"     , "Hip circumference"                     , "cm"                               ,
+  "neck_circum_cm"    , "Neck circumference"                    , "cm"                               ,
+  "bmi"               , "Body mass index (derived)"             , "kg/m^2"                           ,
+  "whr"               , "Waist-hip ratio (derived)"             , "ratio"                            ,
+  "sbp1"              , "Systolic blood pressure, 1st reading"  , "mmHg"                             ,
+  "dbp1"              , "Diastolic blood pressure, 1st reading" , "mmHg"                             ,
+  "total_bilirubin"   , "Total bilirubin"                       , "umol/L"                           ,
+  "total_cholesterol" , "Total cholesterol"                     , "mmol/L"                           ,
+  "fasting_tg"        , "Fasting triglyceride"                  , "mmol/L"                           ,
+  "ruralurban"        , "Area of residence"                     , "rural / urban"                    ,
+  "malefemale"        , "Sex"                                   , "female / male"                    ,
+  "race"              , "Ethnicity"                             , "malay / chinese / indian / other" ,
+  "marital"           , "Marital status"                        , "married / single"                 ,
+  "hx_dm2"            , "History of type 2 diabetes"            , "no / yes"
+)
+
+kable(codebook, caption = "Table 2. Codebook for the analysis dataset.")
+```
+
+There are `r nrow(dat)` observations and `r ncol(dat)` variables, of which `r sum(map_lgl(dat, is.numeric))` are numerical and `r sum(map_lgl(dat, is.factor))` categorical.
+
+# E — Explore the data {#sec-explore}
+
+Exploration has two jobs. The first is to describe the sample, which is what a Table 1 does. The second is to find anything that would make a regression coefficient untrustworthy — a skewed outcome, an impossible value, a variable that is mostly missing. **At this stage you flag what you find. You do not act on it.**
+
+## Descriptive table
+
+```{r}
+#| label: descriptive-table
+
+var_labels <- list(
+  fbs ~ "Fasting blood sugar (mmol/L)",
+  age ~ "Age (years)",
+  height_m ~ "Height (m)",
+  weight_kg ~ "Weight (kg)",
+  waist_cm ~ "Waist circumference (cm)",
+  hip_circum_cm ~ "Hip circumference (cm)",
+  neck_circum_cm ~ "Neck circumference (cm)",
+  bmi ~ "Body mass index (kg/m2)",
+  whr ~ "Waist-hip ratio",
+  sbp1 ~ "Systolic BP (mmHg)",
+  dbp1 ~ "Diastolic BP (mmHg)",
+  total_bilirubin ~ "Total bilirubin (umol/L)",
+  total_cholesterol ~ "Total cholesterol (mmol/L)",
+  fasting_tg ~ "Fasting triglyceride (mmol/L)",
+  ruralurban ~ "Residence",
+  malefemale ~ "Sex",
+  race ~ "Ethnicity",
+  marital ~ "Marital status",
+  hx_dm2 ~ "History of type 2 diabetes"
+)
+
+dat |>
+  tbl_summary(
+    label = var_labels,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing = "always",
+    missing_text = "Missing"
+  ) |>
+  modify_header(stat_0 = "**Mean (SD) or n (%)**") |>
+  modify_caption(
+    "**Table 3. Characteristics of the study sample (N = {N}).**"
+  ) |>
+  bold_labels()
+```
+
+Missing data is negligible here: the largest count is for total bilirubin, and no variable used in the models below loses more than a handful of records. This matters for a reason given in Section [-@sec-apply]: `lm()` performs **complete-case analysis** by default, silently dropping any row with a missing value on any variable in the formula.
+
+## The outcome
+
+```{r}
+#| label: fig-fbs-dist
+#| fig-cap: "Distribution of fasting blood sugar. The distribution is unimodal but strongly right-skewed, with a long tail of high values."
+#| fig-height: 3.6
+
+skewness <- function(x) {
+  x <- x[!is.na(x)]
+  mean((x - mean(x))^3) / sd(x)^3
+}
+
+p_hist <- ggplot(dat, aes(x = fbs)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = "white") +
+  labs(x = "Fasting blood sugar (mmol/L)", y = "Number of participants")
+
+p_box <- ggplot(dat, aes(x = fbs)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.6) +
+  scale_y_continuous(breaks = NULL) +
+  labs(x = "Fasting blood sugar (mmol/L)", y = NULL)
+
+p_hist / p_box + plot_layout(heights = c(3, 1))
+```
+
+Fasting blood sugar ranges from `r round(min(dat$fbs), 2)` to `r round(max(dat$fbs), 2)` mmol/L, with a mean of `r round(mean(dat$fbs), 2)` and a median of `r round(median(dat$fbs), 2)` mmol/L. The mean exceeds the median, and the skewness is `r round(skewness(dat$fbs), 2)` — a symmetric distribution would give roughly zero. Note this now; it will reappear in Section [-@sec-assess] as a violated assumption, and it is not a mistake to be corrected but a property of the measurement.
+
+## Box-and-whisker plots for the numerical covariates
+
+Rather than write one `ggplot` call per variable, reshape to long format and let `facet_wrap()` do the repetition. This is the tidy solution to "I need the same plot for fifteen variables".
+
+```{r}
+#| label: fig-box-numeric
+#| fig-cap: "Box-and-whisker plots of the numerical covariates. Each panel has its own scale because the variables are on different units. Points beyond the whiskers lie more than 1.5 times the interquartile range from the nearest quartile."
+#| fig-height: 6
+
+dat |>
+  select(where(is.numeric), -fbs) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  ggplot(aes(y = value)) +
+  geom_boxplot(fill = "grey80", outlier.alpha = 0.25, outlier.size = 0.6) +
+  facet_wrap(~variable, scales = "free_y", ncol = 5) +
+  scale_x_continuous(breaks = NULL) +
+  labs(x = NULL, y = "Observed value (see codebook for units)")
+```
+
+## The outcome by each categorical covariate
+
+```{r}
+#| label: fig-box-categorical
+#| fig-cap: "Fasting blood sugar by each categorical covariate. Differences between the boxes preview the crude regression coefficients in Section 5.1."
+#| fig-height: 5
+
+dat |>
+  select(fbs, where(is.factor)) |>
+  pivot_longer(-fbs, names_to = "variable", values_to = "level") |>
+  ggplot(aes(x = level, y = fbs)) +
+  geom_boxplot(fill = "grey80", outlier.alpha = 0.2, outlier.size = 0.5) +
+  facet_wrap(~variable, scales = "free_x", ncol = 3) +
+  labs(x = NULL, y = "Fasting blood sugar (mmol/L)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+The panel for history of type 2 diabetes shows the largest separation by a wide margin — an unsurprising result that nevertheless anchors everything that follows.
+
+## Scatter plots against the leading numerical covariates
+
+```{r}
+#| label: fig-scatter
+#| fig-cap: "Fasting blood sugar against four numerical covariates, with the least-squares line. The clouds are wide and the lines nearly flat: these are real but weak associations."
+#| fig-height: 5
+
+dat |>
+  select(fbs, age, bmi, whr, fasting_tg) |>
+  pivot_longer(-fbs, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value, y = fbs)) +
+  geom_point(alpha = 0.12, size = 0.6) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "firebrick", se = TRUE) +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(x = "Covariate value", y = "Fasting blood sugar (mmol/L)")
+```
+
+## Data-quality flags
+
+::: {.callout-warning}
+## Flagged, not fixed
+
+Exploration turned up three features that a careful analyst records and then leaves alone until there is a reason to act:
+
+1. **`r sum(dat$whr > 1.5, na.rm = TRUE)` participant has a waist–hip ratio above 1.5** (maximum `r round(max(dat$whr, na.rm = TRUE), 2)`). A ratio that high is anatomically implausible and most likely a transcription error in the waist or hip measurement.
+2. **Total bilirubin reaches `r round(max(dat$total_bilirubin, na.rm = TRUE), 1)` umol/L**, far outside the usual reference range, which suggests either genuine pathology in a few participants or a units problem in part of the file.
+3. **Fasting blood sugar is strongly right-skewed** (skewness `r round(skewness(dat$fbs), 2)`), because the sample contains a substantial number of people with diabetes.
+
+None of these observations is deleted, winsorised or imputed anywhere in this document. Deciding to remove a data point is a substantive decision that requires going back to the source records, not a statistical convenience. What we do instead is check, in Section [-@sec-assess], whether any of these values actually change the fitted model.
+:::
+
+# A — Assume {#sec-assume}
+
+Linear regression models the **conditional mean** of the outcome as a linear function of the covariates:
+
+$$y_i = \beta_0 + \beta_1 x_{1i} + \beta_2 x_{2i} + \cdots + \beta_p x_{pi} + \varepsilon_i, \qquad \varepsilon_i \sim N(0, \sigma^2).$$
+
+At this point in the workflow we **assume**, without testing, that
+
+- fasting blood sugar given the covariates follows a **Gaussian (normal) distribution**,
+- with a **constant variance** $\sigma^2$ that does not depend on the covariates,
+- that the relationship between each numerical covariate and the mean outcome is **linear**, and
+- that observations are **independent** of one another.
+
+These four requirements are the **LINE** conditions — Linearity, Independence, Normality, Equal variance — set out in the chapter.
+
+::: {.callout-note}
+## Why assume rather than test, at this stage?
+
+The assumptions of linear regression are about the **errors**, not about the raw outcome. You cannot examine the errors before you have a fitted model, because the residuals that estimate them do not exist yet. Testing the marginal distribution of the outcome before fitting is a common mistake: a right-skewed outcome can perfectly well produce well-behaved residuals once the covariates that drive the skew are in the model.
+
+So the order is fixed: assume now, fit next, check afterwards. Section [-@sec-assess] does the checking, and — as it happens — finds that two of the four assumptions do not hold.
+:::
+
+# A — Apply the models {#sec-apply}
+
+## Crude analysis: simple linear regression, one covariate at a time {#sec-slr}
+
+The first modelling step is deliberately unambitious: regress the outcome on each covariate separately. These are **crude** (unadjusted) estimates. They tell you what each covariate looks like on its own, and they provide the screen that decides which covariates go forward.
+
+Eighteen regressions could be eighteen chunks of copy-pasted code. The tidy alternative is to put the covariate names in a column and map the model over it, so that the eighteen fits, their coefficients and their fit statistics all live in one data frame.
+
+```{r}
+#| label: slr-sweep
+
+covariates <- dat |> select(-fbs) |> names()
+
+slr_fits <- tibble(covariate = covariates) |>
+  mutate(
+    fit = map(covariate, \(v) lm(reformulate(v, response = "fbs"), data = dat)),
+    coefficients = map(fit, \(m) {
+      tidy(m, conf.int = TRUE) |> filter(term != "(Intercept)")
+    }),
+    model_fit = map(fit, glance)
+  )
+
+slr_results <- slr_fits |>
+  select(-fit) |>
+  unnest(coefficients) |>
+  unnest(model_fit, names_sep = "_") |>
+  transmute(
+    covariate,
+    term,
+    beta = estimate,
+    se = std.error,
+    conf.low,
+    conf.high,
+    p_term = p.value,
+    p_model = model_fit_p.value, # overall F-test for the model
+    r_squared = model_fit_r.squared,
+    n = model_fit_nobs
+  )
+
+glimpse(slr_results)
+```
+
+`reformulate("age", response = "fbs")` builds the formula `fbs ~ age` from strings, which is what makes the loop possible. For a categorical covariate the fit produces one row per non-reference level, so `race` contributes three rows; the **overall** p-value for such a variable is the model F-test (`p_model`), not any single coefficient.
+
+### Screening on p < 0.20
+
+The specification for this analysis screens covariates at **p < 0.20**, using the overall test for each variable. A liberal threshold is used on purpose: a covariate that is unimpressive on its own can still matter after adjustment, and screening at 0.05 discards such variables too early.
+
+```{r}
+#| label: slr-table
+
+slr_table <- slr_results |>
+  mutate(
+    Covariate = covariate,
+    Level = str_remove(term, fixed(covariate)),
+    Level = if_else(Level == "", "-", Level),
+    Beta = round(beta, 4),
+    `95% CI` = paste0(round(conf.low, 3), ", ", round(conf.high, 3)),
+    `p (term)` = signif(p_term, 3),
+    `p (variable)` = signif(p_model, 3),
+    `R2` = round(r_squared, 4),
+    n = n,
+    Selected = if_else(p_model < 0.20, "yes", "no")
+  ) |>
+  select(
+    Covariate,
+    Level,
+    Beta,
+    `95% CI`,
+    `p (term)`,
+    `p (variable)`,
+    `R2`,
+    n,
+    Selected
+  ) |>
+  arrange(desc(`R2`))
+
+datatable(
+  slr_table,
+  caption = "Table 4. Crude (unadjusted) simple linear regression of fasting blood sugar on each covariate in turn. 'Selected' flags variables meeting the p < 0.20 screen. Interactive: sort any column.",
+  rownames = FALSE,
+  options = list(pageLength = 10, scrollX = TRUE)
+) |>
+  formatStyle(
+    "Selected",
+    backgroundColor = styleEqual(c("yes", "no"), c("#e8f4ea", "#fdeaea"))
+  )
+```
+
+```{r}
+#| label: slr-summary-numbers
+
+n_screened <- slr_results |>
+  distinct(covariate, p_model) |>
+  filter(p_model < 0.20) |>
+  nrow()
+n_total <- length(covariates)
+not_screened <- slr_results |>
+  distinct(covariate, p_model) |>
+  filter(p_model >= 0.20) |>
+  pull(covariate)
+max_r2_other <- slr_results |>
+  filter(covariate != "hx_dm2") |>
+  slice_max(r_squared, n = 1)
+```
+
+`r n_screened` of the `r n_total` covariates pass the screen. The two that do not are `r paste(not_screened, collapse = " and ")`.
+
+Two features of this table matter more than the individual coefficients.
+
+**Significance is cheap at this sample size.** With n over four thousand, a p-value below 0.001 requires only a very small association. A history of type 2 diabetes explains `r round(100 * slr_results |> filter(covariate == "hx_dm2") |> pull(r_squared), 1)`% of the variance in fasting blood sugar, which is substantial. The next best covariate, `r max_r2_other$covariate`, explains `r round(100 * max_r2_other$r_squared, 1)`%. Everything else explains less. A statistically significant coefficient here is not evidence of an important one.
+
+**The derived indices do not beat the raw measurement.** Waist circumference on its own has a higher R-squared (`r round(100 * slr_results |> filter(covariate == "waist_cm") |> pull(r_squared), 2)`%) than either BMI (`r round(100 * slr_results |> filter(covariate == "bmi") |> pull(r_squared), 2)`%) or waist–hip ratio (`r round(100 * slr_results |> filter(covariate == "whr") |> pull(r_squared), 2)`%). Deriving a variable does not automatically improve prediction — a useful corrective to the assumption that a composite index must be better than its parts.
+
+## Dummy variables for categorical covariates {#sec-dummy}
+
+When a factor enters a regression, R replaces it with a set of **dummy** (indicator) variables — one fewer than the number of levels. This happens automatically, but it is worth seeing once, because every interpretation of a categorical coefficient depends on it.
+
+```{r}
+#| label: dummy-race
+
+model.matrix(~race, data = dat) |> head(6)
+```
+
+Ethnicity has four levels, so it produces **three** dummy columns. Malay, the reference, has zeros in all three; it is represented by the intercept. This is **treatment coding**, R's default. If all four levels had their own column, the four would sum to the intercept column and the model would be unidentifiable — hence *k* − 1 columns for *k* levels.
+
+Fitting the model on the manually built dummies gives exactly the same result as fitting it on the factor:
+
+```{r}
+#| label: dummy-equivalence
+
+dat_dummy <- dat |>
+  mutate(
+    race_chinese = as.integer(race == "chinese"),
+    race_indian = as.integer(race == "indian"),
+    race_other = as.integer(race == "other")
+  )
+
+manual <- lm(fbs ~ race_chinese + race_indian + race_other, data = dat_dummy)
+factor_ <- lm(fbs ~ race, data = dat)
+
+bind_rows(
+  tidy(manual) |> mutate(approach = "manual dummies"),
+  tidy(factor_) |> mutate(approach = "factor")
+) |>
+  transmute(
+    approach,
+    term,
+    estimate = signif(estimate, 4),
+    std.error = signif(std.error, 4),
+    p.value = fmt_p(p.value)
+  ) |>
+  kable(
+    caption = "Table 5. Manually created dummy variables and an R factor give identical coefficients."
+  )
+```
+
+Let the factor do the work. Creating dummies by hand is useful for understanding and a liability in practice, because it is easy to forget a level or to mislabel the reference.
+
+## Main-effect multiple linear regression {#sec-mlr}
+
+### Choosing the covariates
+
+Covariate selection here is **substantive first, statistical second**. The p < 0.20 screen removes variables that are clearly going nowhere; it does not choose the model. **No stepwise, forward or backward selection is used** — automated selection procedures produce standard errors and p-values that are known to be too optimistic, because they ignore the fact that the model itself was chosen from the data.
+
+The covariate set is built from what is known about fasting glucose:
+
+- **Adiposity.** Excess adiposity is the dominant modifiable determinant of fasting glucose. In a Malaysian population, waist circumference, BMI and waist–hip ratio have been shown to differ in how well they discriminate metabolic syndrome, and the ranking varies by sex and ethnicity [@cheong2015]. Waist circumference is the strongest single correlate of metabolic-syndrome indicators, ahead of percentage body fat [@shen2006]. **BMI** and **waist–hip ratio** are included to represent overall and central adiposity respectively.
+- **Triglyceride.** Fasting triglyceride and fasting glucose are so closely linked through insulin resistance that their product is used as a surrogate index of it [@tao2022]. **Fasting triglyceride** is included.
+- **Blood pressure and cholesterol.** In a ten-year cohort, blood pressure, lipids and glycaemia behaved as three correlated factors, each predicting incident type 2 diabetes, with central adiposity shared across all three [@ayubi2015]. **Systolic blood pressure** and **total cholesterol** are included.
+- **Ethnicity.** Malaysian national morbidity surveys show ethnic variation in prediabetes and diabetes prevalence, with differences in insulin resistance and beta-cell function between Malay, Chinese, Indian and Orang Asli communities [@chua2020]. **Ethnicity** is included.
+- **Age and history of diabetes.** Both are standard determinants and both pass the screen decisively. **Age** and **history of type 2 diabetes** are included.
+- **Residence.** Urbanisation is associated with lower physical activity across 22 countries including Malaysia [@boakye2023], which makes urban–rural residence epidemiologically plausible. It is included **despite failing the p < 0.20 screen** — its crude p-value is `r round(slr_results |> filter(covariate == "ruralurban") |> pull(p_model), 3)`. This is a deliberate, disclosed decision, taken so that the model contains a categorical covariate whose adjusted effect is not already obvious, and because a variable can be null crudely and informative after adjustment.
+
+### Why waist circumference is left out
+
+Three measures of adiposity are available, and they overlap:
+
+```{r}
+#| label: adiposity-correlation
+
+dat |>
+  select(bmi, whr, waist_cm) |>
+  cor(use = "complete.obs") |>
+  round(2) |>
+  kable(
+    caption = "Table 6. Pearson correlations among the three adiposity measures."
+  )
+```
+
+Waist circumference correlates strongly with both BMI and waist–hip ratio, while BMI and waist–hip ratio are nearly independent of each other. Including all three would put three overlapping measures of the same construct into one model. **BMI and waist–hip ratio are kept; waist circumference is dropped.** Section [-@sec-vif] shows what the variance inflation factors look like as a result.
+
+### Fitting the model
+
+```{r}
+#| label: fit-main
+
+m_main <- lm(
+  fbs ~ ruralurban +
+    race +
+    age +
+    bmi +
+    whr +
+    sbp1 +
+    total_cholesterol +
+    fasting_tg +
+    hx_dm2,
+  data = dat
+)
+
+summary(m_main)
+```
+
+The formatted version of this table belongs in Section [-@sec-present]; the raw output is shown here because it is what you actually look at while working.
+
+```{r}
+#| label: main-numbers
+
+g_main <- glance(m_main)
+t_main <- tidy(m_main, conf.int = TRUE)
+n_main <- g_main$nobs
+n_dropped <- nrow(dat) - n_main
+b_age_crude <- slr_results |> filter(covariate == "age") |> pull(beta)
+p_age_crude <- slr_results |> filter(covariate == "age") |> pull(p_term)
+row_age <- t_main |> filter(term == "age")
+```
+
+The model is fitted on **`r n_main` participants**, `r n_dropped` fewer than the `r nrow(dat)` in the dataset. Those `r n_dropped` are dropped because they are missing a value on at least one variable in the formula — this is complete-case analysis, `lm()`'s default behaviour, and it should always be stated with the analysed n. It explains `r round(100 * g_main$r.squared, 2)`% of the variance in fasting blood sugar (adjusted R-squared `r round(100 * g_main$adj.r.squared, 2)`%).
+
+::: {.callout-important}
+## The most instructive result in this analysis
+
+Age has a crude slope of `r round(b_age_crude, 4)` mmol/L per year with a p-value of `r signif(p_age_crude, 2)` — about as significant as an association gets. **After adjustment its slope falls to `r round(row_age$estimate, 4)` mmol/L per year, with a p-value of `r round(row_age$p.value, 3)`.**
+
+Nothing went wrong. The crude association between age and fasting blood sugar in these data is almost entirely explained by the other covariates: older participants have higher blood pressure, more adiposity, higher triglyceride and a greater chance of a diabetes history, and once those are held constant, age itself adds very little. That is precisely what a partial regression coefficient means, and it is the reason crude and adjusted estimates must never be reported as if they were the same quantity.
+:::
+
+### Checking for multicollinearity {#sec-vif}
+
+The **variance inflation factor** measures how much a coefficient's variance is inflated by its correlation with the other covariates. For a factor with more than two levels, `car::vif()` reports a generalised VIF; the comparable quantity is the last column, raised to the power two.
+
+```{r}
+#| label: vif-table
+
+vif(m_main) |>
+  as.data.frame() |>
+  rownames_to_column("Variable") |>
+  mutate(across(where(is.numeric), \(x) round(x, 2))) |>
+  kable(
+    caption = "Table 7. Variance inflation factors for the main-effect model."
+  )
+```
+
+All values sit close to 1, comfortably below the conventional thresholds of 5 or 10. Dropping waist circumference did its job: the adiposity terms no longer compete with one another.
+
+## Models with an interaction term {#sec-interaction}
+
+The main-effect model assumes the effect of each covariate is the **same at every value of every other covariate**. An interaction term relaxes that assumption for one specific pair. Only one interaction is added at a time, and — following the specification — the term is kept whatever its p-value.
+
+### Numerical by numerical: waist–hip ratio and triglyceride
+
+```{r}
+#| label: fit-int-numnum
+
+m_int_numnum <- update(m_main, . ~ . + whr:fasting_tg)
+
+tidy(m_int_numnum, conf.int = TRUE) |>
+  filter(str_detect(term, ":")) |>
+  transmute(
+    term,
+    estimate = signif(estimate, 4),
+    std.error = signif(std.error, 4),
+    `95% CI` = paste0(signif(conf.low, 3), ", ", signif(conf.high, 3)),
+    statistic = signif(statistic, 4),
+    p.value = fmt_p(p.value)
+  ) |>
+  kable(
+    caption = "Table 8. Interaction term, waist-hip ratio by fasting triglyceride."
+  )
+```
+
+### Numerical by categorical: age and history of diabetes
+
+```{r}
+#| label: fit-int-numcat
+
+m_int_numcat <- update(m_main, . ~ . + age:hx_dm2)
+
+tidy(m_int_numcat, conf.int = TRUE) |>
+  filter(str_detect(term, ":")) |>
+  transmute(
+    term,
+    estimate = signif(estimate, 4),
+    std.error = signif(std.error, 4),
+    `95% CI` = paste0(signif(conf.low, 3), ", ", signif(conf.high, 3)),
+    statistic = signif(statistic, 4),
+    p.value = fmt_p(p.value)
+  ) |>
+  kable(
+    caption = "Table 9. Interaction term, age by history of type 2 diabetes."
+  )
+```
+
+::: {.callout-note}
+## Three rules for a model with an interaction
+
+1. **Keep the main effects.** A model with `age:hx_dm2` must also contain `age` and `hx_dm2`. `update(m_main, . ~ . + age:hx_dm2)` guarantees this; writing the formula by hand does not.
+2. **The main-effect coefficients change meaning.** In the interaction model, the coefficient for `age` is no longer the average age slope. It is the age slope **for the reference group** — participants with no history of diabetes.
+3. **Do not read the interaction coefficient as an effect.** It is a *difference between* effects: how much the age slope changes when moving from no diabetes history to a history.
+:::
+
+## Comparing the models {#sec-anova}
+
+Two models are **nested** when the smaller one can be obtained by setting parameters of the larger one to zero. The main-effect model is nested inside each interaction model, so `anova()` can perform an F-test of whether the extra term is worth its degree of freedom.
+
+```{r}
+#| label: anova-numnum
+
+anova(m_main, m_int_numnum)
+```
+
+```{r}
+#| label: anova-numcat
+
+anova(m_main, m_int_numcat)
+```
+
+```{r}
+#| label: model-comparison
+
+a_numnum <- anova(m_main, m_int_numnum)
+a_numcat <- anova(m_main, m_int_numcat)
+
+comparison <- tibble(
+  Model = c("Main effects only", "+ whr x fasting_tg", "+ age x hx_dm2"),
+  `Adjusted R2` = round(
+    c(
+      glance(m_main)$adj.r.squared,
+      glance(m_int_numnum)$adj.r.squared,
+      glance(m_int_numcat)$adj.r.squared
+    ),
+    4
+  ),
+  AIC = round(c(AIC(m_main), AIC(m_int_numnum), AIC(m_int_numcat)), 1),
+  `F vs main` = c(
+    "-",
+    format(round(a_numnum$F[2], 2)),
+    format(round(a_numcat$F[2], 2))
+  ),
+  `p vs main` = c("-", fmt_p(a_numnum$`Pr(>F)`[2]), fmt_p(a_numcat$`Pr(>F)`[2]))
+)
+
+kable(
+  comparison,
+  caption = "Table 10. Comparison of the main-effect model with each interaction model. The main-effect model is the reference, so it has no F-test of its own."
+)
+```
+
+Both interactions improve on the main-effect model, but **the age by diabetes-history interaction improves it far more**: a much larger F statistic, a much smaller p-value, and the lowest AIC of the three. It is selected as the final model.
+
+```{r}
+#| label: final-model
+
+m_final <- m_int_numcat
+```
+
+Note what this comparison is and is not. It is a test between two models that were **specified in advance** on substantive grounds. It is not a search: no interactions beyond these two were examined, and neither term was chosen because it happened to be significant.
+
+# A — Assess the model {#sec-assess}
+
+Fitting a model is easy; the assessment is what makes the results reportable. **The model assessed here is the one selected in Section [-@sec-anova]** — the model carrying the age by diabetes-history interaction. Three questions are put to it:
+
+1. Do the LINE assumptions hold?
+2. Is anything the model **left out** still visible in what it could not explain?
+3. Is any individual observation driving the results?
+
+The second question is the one most analyses skip. It is asked here in full, and in this dataset it changes the model.
+
+Assessment uses the **residuals** — the differences between observed and fitted values — which are what we have in place of the unobservable errors.
+
+```{r}
+#| label: augment
+
+diag_final <- augment(m_final)
+diag_main <- augment(m_main)
+
+glimpse(diag_final |> select(fbs, .fitted, .resid, .std.resid, .hat, .cooksd))
+```
+
+`broom::augment()` returns the original data with six diagnostic columns appended, so residual analysis becomes ordinary data manipulation. Everything below runs on the interaction model; the main-effect model is brought in only where the two differ.
+
+## L — Linearity
+
+```{r}
+#| label: fig-resid-fitted
+#| fig-cap: "Residuals against fitted values for the interaction model. Under linearity the smoother should track the horizontal reference line. The strong upward drift and the funnel shape both indicate problems."
+#| fig-height: 4
+
+ggplot(diag_final, aes(x = .fitted, y = .resid)) +
+  geom_point(alpha = 0.15, size = 0.7) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    colour = "firebrick",
+    se = FALSE
+  ) +
+  labs(x = "Fitted value (mmol/L)", y = "Residual (mmol/L)")
+```
+
+The smoother curves upward at high fitted values: the model systematically under-predicts for participants whose predicted fasting blood sugar is already high. The spread of the residuals also widens from left to right, which is the equal-variance problem that appears again below.
+
+Plotting the residuals against each numerical covariate separately localises any curvature:
+
+```{r}
+#| label: fig-resid-predictors
+#| fig-cap: "Residuals against each numerical covariate in the interaction model. A horizontal band centred on zero is what linearity looks like; systematic curvature would point to the covariate needing a transformation."
+#| fig-height: 5
+
+diag_final |>
+  select(.resid, age, bmi, whr, sbp1, total_cholesterol, fasting_tg) |>
+  pivot_longer(-.resid, names_to = "variable", values_to = "value") |>
+  ggplot(aes(x = value, y = .resid)) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    colour = "firebrick",
+    se = FALSE
+  ) +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(x = "Covariate value", y = "Residual (mmol/L)")
+```
+
+No single covariate shows dramatic curvature. The linearity problem is in the outcome's scale, not in any one predictor.
+
+The categorical terms deserve the same check. For a factor the question is not curvature but **level**: the residuals should average zero within every category, because a model that systematically over-predicts one ethnic group and under-predicts another is mis-specified for that variable.
+
+```{r}
+#| label: fig-resid-factors
+#| fig-cap: "Residuals by each categorical variable in the interaction model. Each box should sit on the zero line; a box shifted away from zero would mean the model is systematically wrong for that group."
+#| fig-height: 3.6
+
+diag_final |>
+  select(.resid, ruralurban, race, hx_dm2) |>
+  mutate(across(-.resid, as.character)) |>
+  pivot_longer(-.resid, names_to = "variable", values_to = "level") |>
+  ggplot(aes(x = level, y = .resid)) +
+  geom_boxplot(outlier.alpha = 0.1, outlier.size = 0.5, fill = "grey92") +
+  geom_hline(yintercept = 0, linetype = 2, colour = "firebrick") +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(x = NULL, y = "Residual (mmol/L)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+Every box straddles zero. The medians sit slightly below zero throughout, which is the signature of a right-skewed outcome — the mean is pulled above the median in every group — not of a mis-specified factor.
+
+## Residuals against variables *not* in the model {#sec-resid-omitted}
+
+Nine covariates were left out of the model. **The residuals are the only place their absence can show up.** If a variable that was never fitted still explains part of what the model got wrong, the model is missing it, and no residual-versus-fitted plot will ever say so — that plot can only report on the variables already included.
+
+This check is skipped in most analyses. It should not be.
+
+```{r}
+#| label: omitted-candidates
+
+omitted_num <- c(
+  "weight_kg",
+  "height_m",
+  "waist_cm",
+  "hip_circum_cm",
+  "neck_circum_cm",
+  "dbp1",
+  "total_bilirubin"
+)
+omitted_cat <- c("malefemale", "marital")
+
+# The residuals of the model being assessed, carried back onto the analysis data.
+resid_dat <- dat |>
+  drop_na(
+    fbs,
+    ruralurban,
+    race,
+    age,
+    bmi,
+    whr,
+    sbp1,
+    total_cholesterol,
+    fasting_tg,
+    hx_dm2
+  ) |>
+  mutate(.resid = residuals(m_final))
+```
+
+::: {.callout-note}
+## One family of variables is excluded on principle, not on evidence
+
+`mogtt_1_hour_post` and `mogtt_2_hour_post` are blood glucose measured one and two hours after a glucose load. They are **another measurement of the outcome**, not covariates that could explain it. Putting them in the model would predict fasting glucose from glucose, which is circular. They are excluded by design, and the exclusion is stated rather than left silent. `hba1c` is excluded for the same reason.
+:::
+
+```{r}
+#| label: fig-resid-omitted-num
+#| fig-cap: "Residuals of the interaction model against each numerical variable left out of it. A flat smoother means the variable has nothing left to contribute. The panel for total bilirubin does not sit flat."
+#| fig-height: 5
+
+resid_dat |>
+  select(.resid, all_of(omitted_num)) |>
+  pivot_longer(-.resid, names_to = "variable", values_to = "value") |>
+  filter(!is.na(value)) |>
+  ggplot(aes(x = value, y = .resid)) +
+  geom_point(alpha = 0.1, size = 0.5) +
+  geom_hline(yintercept = 0, linetype = 2, colour = "grey40") +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    colour = "firebrick",
+    se = FALSE
+  ) +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(x = "Value of the omitted variable", y = "Residual (mmol/L)")
+```
+
+```{r}
+#| label: fig-resid-omitted-cat
+#| fig-cap: "Residuals of the interaction model by each categorical variable left out of it. Boxes centred on zero mean the model is not systematically wrong for any of these groups."
+#| fig-height: 3.4
+
+resid_dat |>
+  select(.resid, all_of(omitted_cat)) |>
+  mutate(across(-.resid, as.character)) |>
+  pivot_longer(-.resid, names_to = "variable", values_to = "level") |>
+  filter(!is.na(level)) |>
+  ggplot(aes(x = level, y = .resid)) +
+  geom_boxplot(outlier.alpha = 0.1, outlier.size = 0.5, fill = "grey92") +
+  geom_hline(yintercept = 0, linetype = 2, colour = "firebrick") +
+  facet_wrap(~variable, scales = "free_x") +
+  labs(x = NULL, y = "Residual (mmol/L)")
+```
+
+The eye is a poor judge of a flat loess line through four thousand points, so each candidate is also tested formally. Two tests are reported for every one: a regression of the **residual** on the candidate, and an `anova()` comparison of the model **with and without** the candidate, fitted on the same rows so the comparison is legitimate.
+
+```{r}
+#| label: omitted-screen
+
+screen_one <- function(v) {
+  d <- resid_dat |> filter(!is.na(.data[[v]]))
+  a_res <- anova(lm(reformulate(v, ".resid"), data = d))
+  m0 <- lm(formula(m_final), data = d)
+  m1 <- update(m0, reformulate(c(".", v), "."))
+  a_add <- anova(m0, m1)
+  tibble(
+    Variable = v,
+    n = nrow(d),
+    `F (residual ~ variable)` = round(a_res$`F value`[1], 3),
+    `p (residual)` = fmt_p(a_res$`Pr(>F)`[1]),
+    `F (adding to model)` = round(a_add$F[2], 3),
+    `p (adding)` = fmt_p(a_add$`Pr(>F)`[2]),
+    Verdict = if (a_add$`Pr(>F)`[2] < 0.05) {
+      "Add to the model"
+    } else {
+      "Nothing left"
+    }
+  )
+}
+
+screen <- map_dfr(c(omitted_num, omitted_cat), screen_one) |>
+  arrange(`p (adding)`)
+
+kable(
+  screen,
+  caption = "Table 11. Every variable left out of the model, screened against the model's residuals. Both tests use only the rows where the candidate is observed."
+)
+```
+
+```{r}
+#| label: screen-values
+
+added <- screen |> filter(Verdict == "Add to the model")
+```
+
+```{r}
+#| label: waist-correlation-recall
+
+cor_waist_bmi <- cor(dat$waist_cm, dat$bmi, use = "complete.obs")
+p_waist_screen <- screen |> filter(Variable == "waist_cm") |> pull(`p (adding)`)
+```
+
+**`r nrow(added)` of the `r nrow(screen)` candidates carries information the model does not.** Note what the screen clears as much as what it flags. `waist_cm`, dropped back in Section [-@sec-mlr] because it correlates `r sprintf("%.2f", cor_waist_bmi)` with body mass index, leaves **no trace whatsoever** in the residuals (`r ifelse(startsWith(p_waist_screen, "<"), paste("p", p_waist_screen), paste("p =", p_waist_screen))`) — the adiposity information really was already carried by body mass index and waist–hip ratio, and excluding it cost nothing. That is the reassurance this check exists to give.
+
+### Revising the model
+
+The specification is explicit: a variable that shows a reasonable association with the residuals **must be added**. So it is.
+
+```{r}
+#| label: revised-model
+
+m_revised <- update(m_final, . ~ . + total_bilirubin)
+
+summary(m_revised)
+```
+
+```{r}
+#| label: revision-comparison
+
+# Same rows on both sides, so the comparison is a like-for-like test.
+m_final_same <- lm(formula(m_final), data = model.frame(m_revised))
+a_rev <- anova(m_final_same, m_revised)
+t_bili <- tidy(m_revised, conf.int = TRUE) |> filter(term == "total_bilirubin")
+
+tibble(
+  Term = "total_bilirubin",
+  Beta = round(t_bili$estimate, 5),
+  `SE(Beta)` = round(t_bili$std.error, 5),
+  `95% CI` = paste0(
+    round(t_bili$conf.low, 5),
+    ", ",
+    round(t_bili$conf.high, 5)
+  ),
+  `p-value` = fmt_p(t_bili$p.value),
+  `F (1 df)` = round(a_rev$F[2], 3),
+  `Adj. R2 before` = round(summary(m_final_same)$adj.r.squared, 5),
+  `Adj. R2 after` = round(summary(m_revised)$adj.r.squared, 5)
+) |>
+  kable(
+    caption = "Table 12. The term the residual screen forced into the model, and what it bought."
+  )
+```
+
+```{r}
+#| label: revision-numbers
+
+n_revised <- nobs(m_revised)
+n_lost <- nobs(m_final) - n_revised
+bili_per10 <- 10 * t_bili$estimate
+adj_gain <- summary(m_revised)$adj.r.squared -
+  summary(m_final_same)$adj.r.squared
+
+# Are the implausibly high bilirubin values driving the association?
+m_rev_trim <- lm(
+  formula(m_revised),
+  data = dat |> filter(total_bilirubin <= 50)
+)
+t_bili_trim <- tidy(m_rev_trim) |> filter(term == "total_bilirubin")
+```
+
+Total bilirubin enters with a coefficient of `r round(t_bili$estimate, 5)` mmol/L per µmol/L (p `r fmt_p(t_bili$p.value)`). The model loses `r n_lost` records to missing bilirubin, leaving n = `r n_revised`.
+
+::: {.callout-warning}
+## Three things to say about this term, all of them uncomfortable
+
+**It is statistically clear and substantively slight.** A 10 µmol/L difference in total bilirubin — a wide difference — corresponds to `r round(bili_per10, 3)` mmol/L of fasting blood sugar, and adjusted R² rises by `r round(100 * adj_gain, 2)` percentage points. At n = `r n_revised`, a p-value of `r fmt_p(t_bili$p.value)` is not evidence of an important effect. The variable is kept because the workflow's rule requires it, and the smallness is reported alongside it.
+
+**It is not an artefact of the implausible values.** Section [-@sec-explore] flagged bilirubin readings as high as `r round(max(dat$total_bilirubin, na.rm = TRUE), 1)` µmol/L. Refitting with every value above 50 µmol/L excluded gives β = `r round(t_bili_trim$estimate, 5)` (p `r fmt_p(t_bili_trim$p.value)`) — if anything larger. The association does not rest on the outliers.
+
+**Its direction contradicts the published literature.** Wei et al. [@wei2021], analysing 38,641 adults in NHANES, report *lower* bilirubin with *higher* type 2 diabetes risk. The coefficient here is **positive**. This document reports the discrepancy and stops there. A cross-sectional association in one sample, worth `r round(100 * adj_gain, 2)` percentage points of explained variation, is not a reason to construct a biological story.
+:::
+
+Everything from here on assesses the **revised** model.
+
+```{r}
+#| label: augment-revised
+
+diag_rev <- augment(m_revised)
+```
+
+## I — Independence
+
+Independence cannot be checked from residual plots in a cross-sectional study; it is a property of the **design**. Observations are not independent when the sampling structure links them: repeated measurements on the same person, patients within the same clinic, households within the same village, or measurements taken in time order.
+
+The MSSM sample is a cross-sectional survey of individuals, and each row is a different participant. **Independence is taken to hold by design.** Had the data been longitudinal or multi-centre, this assumption would require a different modelling approach altogether, and no residual plot would have told you so.
+
+## N — Normality of the errors
+
+```{r}
+#| label: fig-normality
+#| fig-cap: "Normal quantile-quantile plot and histogram of the standardised residuals. Under normality the points would follow the diagonal and the histogram would be symmetric. Both show a heavy right tail."
+#| fig-height: 3.8
+
+p_qq <- ggplot(diag_rev, aes(sample = .std.resid)) +
+  stat_qq(alpha = 0.2, size = 0.6) +
+  stat_qq_line(colour = "firebrick") +
+  labs(x = "Theoretical quantile", y = "Standardised residual")
+
+p_res_hist <- ggplot(diag_rev, aes(x = .std.resid)) +
+  geom_histogram(bins = 60, fill = "steelblue", colour = "white") +
+  labs(x = "Standardised residual", y = "Count")
+
+p_qq + p_res_hist
+```
+
+The quantile–quantile plot leaves the diagonal sharply in the upper tail. The residuals are right-skewed, inheriting the skew of the outcome that Section [-@sec-explore] flagged.
+
+A formal test corroborates the plot:
+
+```{r}
+#| label: shapiro
+
+sw <- shapiro.test(diag_rev$.std.resid)
+sw
+```
+
+::: {.callout-warning}
+## Read the plot first, the test second
+
+Shapiro–Wilk rejects normality here with p = `r format.pval(sw$p.value, digits = 3, eps = 2.2e-16)`. But at n = `r nrow(diag_rev)`, a normality test will reject almost any real dataset, because it has the power to detect departures far too small to matter. The reverse is also true: in a sample of 20, the same test will fail to reject data that is visibly non-normal.
+
+**The plot, not the p-value, tells you whether the departure matters.** Here the plot and the test agree, and the departure is large — but the order of reading is what makes the conclusion trustworthy.
+:::
+
+## E — Equal variance
+
+```{r}
+#| label: fig-scale-location
+#| fig-cap: "Scale-location plot. The square root of the absolute standardised residual against the fitted value. A horizontal smoother indicates constant variance; this one rises steeply."
+#| fig-height: 4
+
+ggplot(diag_rev, aes(x = .fitted, y = sqrt(abs(.std.resid)))) +
+  geom_point(alpha = 0.15, size = 0.7) +
+  geom_smooth(
+    method = "loess",
+    formula = y ~ x,
+    colour = "firebrick",
+    se = FALSE
+  ) +
+  labs(
+    x = "Fitted value (mmol/L)",
+    y = "Square root of |standardised residual|"
+  )
+```
+
+```{r}
+#| label: bptest
+
+bp_rev <- bptest(m_revised)
+bp_main <- bptest(m_main)
+bp_rev
+```
+
+The Breusch–Pagan test rejects constant variance decisively (p = `r format.pval(bp_rev$p.value, digits = 3, eps = 2.2e-16)`), agreeing with the plot: residual spread grows as the fitted value grows. Participants with higher predicted fasting blood sugar are predicted with much less precision than those with lower values. The main-effect model fails the same test in the same direction (p = `r format.pval(bp_main$p.value, digits = 3, eps = 2.2e-16)`); neither the interaction nor the added covariate repaired it.
+
+## Outliers, leverage and influence
+
+Three distinct ideas are often confused:
+
+- an **outlier** has an unusual *outcome* given its covariates — a large residual;
+- a **high-leverage** point has an unusual *covariate pattern* — a large hat value;
+- an **influential** point actually *changes the fitted coefficients* when removed — a large Cook's distance.
+
+A point can be any one of these without being the others. Only the third is a reason for concern.
+
+```{r}
+#| label: influence-counts
+
+p_params <- length(coef(m_revised))
+n_obs <- nrow(diag_rev)
+
+thr_lev <- 2 * p_params / n_obs
+thr_cook <- 4 / n_obs
+
+thresholds <- tibble(
+  Criterion = c(
+    "Outlier: |standardised residual| > 3",
+    "High leverage: hat value > 2p/n",
+    "Cook's distance > 4/n",
+    "Cook's distance > 0.5 (influential)",
+    "Cook's distance > 1 (highly influential)"
+  ),
+  Threshold = round(c(3, thr_lev, thr_cook, 0.5, 1), 5),
+  `Number of observations` = c(
+    sum(abs(diag_rev$.std.resid) > 3),
+    sum(diag_rev$.hat > thr_lev),
+    sum(diag_rev$.cooksd > thr_cook),
+    sum(diag_rev$.cooksd > 0.5),
+    sum(diag_rev$.cooksd > 1)
+  )
+)
+
+kable(
+  thresholds,
+  caption = "Table 13. Counts of outlying, high-leverage and influential observations in the revised model."
+)
+```
+
+```{r}
+#| label: fig-influence
+#| fig-cap: "Cook's distance for every observation, and standardised residual against leverage. The largest Cook's distance is far below the conventional cut-off of 0.5, so no single observation dominates the fit."
+#| fig-height: 3.8
+
+p_cook <- diag_rev |>
+  mutate(obs = row_number()) |>
+  ggplot(aes(x = obs, y = .cooksd)) +
+  geom_col(width = 1, colour = "steelblue") +
+  geom_hline(yintercept = thr_cook, linetype = 2, colour = "firebrick") +
+  labs(x = "Observation index", y = "Cook's distance")
+
+p_lev <- ggplot(diag_rev, aes(x = .hat, y = .std.resid)) +
+  geom_point(aes(size = .cooksd), alpha = 0.2) +
+  geom_hline(yintercept = c(-3, 3), linetype = 2, colour = "firebrick") +
+  scale_size_continuous(range = c(0.3, 3), guide = "none") +
+  labs(x = "Leverage (hat value)", y = "Standardised residual")
+
+p_cook + p_lev
+```
+
+```{r}
+#| label: cook-max
+
+max_cook <- max(diag_rev$.cooksd)
+```
+
+The largest Cook's distance in the whole dataset is `r round(max_cook, 4)`, well below 0.5, and `r sum(diag_rev$.cooksd > thr_cook)` observations exceed the far more sensitive 4/n rule. That is what a large sample buys: with more than four thousand observations, no single participant can move the coefficients far, however unusual their values.
+
+### Listing the severe outliers
+
+```{r}
+#| label: severe-outliers
+
+diag_indexed <- diag_rev |> mutate(observation = row_number())
+
+outlier_tab <- diag_indexed |>
+  filter(abs(.std.resid) > 3) |>
+  arrange(desc(abs(.std.resid))) |>
+  transmute(
+    observation,
+    fbs = round(fbs, 2),
+    fitted = round(.fitted, 2),
+    `std. residual` = round(.std.resid, 2),
+    leverage = round(.hat, 4),
+    `Cook's D` = round(.cooksd, 4),
+    age,
+    hx_dm2,
+    race
+  )
+
+datatable(
+  outlier_tab,
+  caption = "Table 14. Every severe outlier: all observations with a standardised residual larger than 3 in absolute value, worst first. Interactive: sort and search.",
+  rownames = FALSE,
+  options = list(pageLength = 10, scrollX = TRUE)
+)
+```
+
+`r nrow(outlier_tab)` observations are severe outliers, and the pattern is uniform: `r sum(outlier_tab[["std. residual"]] > 0)` of them have a **positive** residual, meaning the model predicted a fasting blood sugar far below what was measured. Their observed values run up to `r round(max(outlier_tab$fbs), 2)` mmol/L. These are not data-entry errors; they are people with severe hyperglycaemia that a linear model on this covariate set cannot reach.
+
+### Listing the severe influential observations
+
+An outlier is only a problem if it also moves the coefficients. The two conditions are combined:
+
+```{r}
+#| label: severe-influentials
+
+severe <- diag_indexed |>
+  filter(.cooksd > thr_cook, abs(.std.resid) > 3) |>
+  arrange(desc(.cooksd))
+
+datatable(
+  severe |>
+    transmute(
+      observation,
+      fbs = round(fbs, 2),
+      fitted = round(.fitted, 2),
+      `std. residual` = round(.std.resid, 2),
+      leverage = round(.hat, 4),
+      `Cook's D` = round(.cooksd, 4),
+      age,
+      hx_dm2,
+      race,
+      bmi = round(bmi, 1),
+      fasting_tg = round(fasting_tg, 2)
+    ),
+  caption = "Table 15. Every severe influential observation: Cook's distance above 4/n AND standardised residual above 3 in absolute value, largest Cook's distance first. Interactive: sort and search.",
+  rownames = FALSE,
+  options = list(pageLength = 10, scrollX = TRUE)
+)
+```
+
+::: {.callout-important}
+## Why these observations, and not others, are called severe
+
+The conventional rule — Cook's distance above 0.5 — **flags nothing at all here**, because the largest value in the data is `r round(max_cook, 4)`. A rule that never fires cannot be used to decide anything, so a defensible cut-off has to be stated rather than borrowed.
+
+The 4/n rule fires too easily in the other direction: `r sum(diag_rev$.cooksd > thr_cook)` observations, `r round(100 * sum(diag_rev$.cooksd > thr_cook) / n_obs, 1)`% of the sample, many of them well-fitted points that are merely unusual in their covariates.
+
+**Requiring both conditions** — influential by 4/n *and* badly fitted by the residual rule — isolates observations that are simultaneously poorly predicted and capable of moving the coefficients. That gives `r nrow(severe)` observations, `r round(100 * nrow(severe) / n_obs, 1)`% of the sample.
+
+What they are matters more than how many. **`r sum(severe$fbs > 15)` of the `r nrow(severe)` have a fasting blood sugar above 15 mmol/L**, `r sum(severe$hx_dm2 == "yes")` have a recorded history of type 2 diabetes, and only `r sum(severe$.std.resid < 0)` have a negative residual. They are overwhelmingly participants with very high glucose that the model under-predicts — **the clinically most important people in the dataset, not defective records.**
+
+That is why the next section refits the model without them as a **sensitivity analysis** and reports both fits, rather than deleting them and moving on. Nothing here justifies discarding a real measurement.
+:::
+
+**No observation is removed from the primary model.** The refit without these `r nrow(severe)` observations is reported alongside it in Section [-@sec-present], never in place of it.
+
+## The verdict {#sec-verdict}
+
+::: {.callout-important}
+## What holds, what does not, and what follows
+
+| Assumption | Verdict | Evidence |
+|:---|:---|:---|
+| **L**inearity | Partly violated | Residual-versus-fitted smoother drifts upward at high fitted values |
+| **I**ndependence | Holds by design | Cross-sectional survey, one row per participant |
+| **N**ormality | Violated | Q–Q plot departs sharply in the upper tail |
+| **E**qual variance | Violated | Breusch–Pagan p = `r format.pval(bp_rev$p.value, digits = 3, eps = 2.2e-16)`; residual spread widens with the fitted value |
+| Omitted variables | One found and added | `total_bilirubin` showed a residual association (Table 11) and now sits in the model |
+
+Two of the four LINE conditions fail, in the revised model and in the main-effect model alike (Breusch–Pagan p = `r format.pval(bp_main$p.value, digits = 3, eps = 2.2e-16)`). **This must be reported, not suppressed.** It has real consequences:
+
+- The **coefficients themselves remain unbiased and interpretable**. Least squares does not require normality for that.
+- The **standard errors, confidence intervals and p-values should not be taken at face value**, because they are computed assuming constant variance.
+
+What a full analysis would do next, in roughly this order: use **heteroscedasticity-consistent standard errors** (the `sandwich` package) to keep the model and repair the inference; or transform the outcome — the chapter shows that a log transformation of fasting blood sugar improves the fit substantially but still does not repair the variance problem; or move to a model designed for a skewed positive outcome, such as a gamma regression with a log link.
+
+None of these is applied here, because the point of this practical is the workflow. **The results in Section [-@sec-present] are presented as a demonstration of that workflow, not as a definitive analysis of these data.**
+:::
+
+# P — Present the results {#sec-present}
+
+The tables in this section are the ones a reader sees. Everything before this point was for the analyst.
+
+Three models are reported: the main-effect model from Section [-@sec-mlr], the interaction model as revised by the assessment, and that same revised model refitted without the severe influential observations.
+
+## The main-effect model
+
+```{r}
+#| label: main-effect-table
+
+tbl_main <- m_main |>
+  tbl_regression(
+    intercept = TRUE,
+    label = list(
+      ruralurban ~ "Residence",
+      race ~ "Ethnicity",
+      age ~ "Age (years)",
+      bmi ~ "Body mass index (kg/m2)",
+      whr ~ "Waist-hip ratio",
+      sbp1 ~ "Systolic BP (mmHg)",
+      total_cholesterol ~ "Total cholesterol (mmol/L)",
+      fasting_tg ~ "Fasting triglyceride (mmol/L)",
+      hx_dm2 ~ "History of type 2 diabetes"
+    ),
+    estimate_fun = \(x) style_number(x, digits = 3),
+    pvalue_fun = \(x) style_pvalue(x, digits = 3)
+  ) |>
+  modify_column_unhide(column = std.error) |>
+  modify_header(
+    estimate = "**Beta**",
+    std.error = "**SE(Beta)**",
+    conf.low = "**95% CI**",
+    p.value = "**p-value**"
+  ) |>
+  modify_caption(
+    "**Table 16. Main-effect multiple linear regression of fasting blood sugar (mmol/L).**"
+  ) |>
+  add_glance_source_note(
+    include = c(nobs, r.squared, adj.r.squared, sigma),
+    label = list(nobs ~ "n", sigma ~ "Residual SE")
+  ) |>
+  bold_labels()
+
+tbl_main
+```
+
+### Interpreting a numerical covariate
+
+```{r}
+#| label: interp-numerical
+
+row_tg <- t_main |> filter(term == "fasting_tg")
+row_bmi <- t_main |> filter(term == "bmi")
+```
+
+Take **fasting triglyceride**, whose adjusted coefficient is `r round(row_tg$estimate, 3)` with a 95% confidence interval of `r round(row_tg$conf.low, 3)` to `r round(row_tg$conf.high, 3)` mmol/L and p `r if (row_tg$p.value < 0.001) "< 0.001" else round(row_tg$p.value, 3)`. Written out in full:
+
+> Each additional 1 mmol/L of fasting triglyceride was associated with a `r round(row_tg$estimate, 3)` mmol/L higher mean fasting blood sugar (95% CI `r round(row_tg$conf.low, 3)` to `r round(row_tg$conf.high, 3)`), after adjusting for residence, ethnicity, age, body mass index, waist–hip ratio, systolic blood pressure, total cholesterol and history of type 2 diabetes.
+
+Every element of that sentence is doing work:
+
+- **"Each additional 1 mmol/L"** — the coefficient is a *rate*, per one unit of the covariate, and the unit must be named.
+- **"higher mean fasting blood sugar"** — the model describes the **mean** outcome, not any individual's value, and the direction (higher, not lower) comes from the sign.
+- **"associated with"** — not "causes". This is a cross-sectional observational study.
+- **the confidence interval** — the interval excludes zero, which is the same information the p-value carries, but it also states the range of effects the data are compatible with. Report it always.
+- **"after adjusting for..."** — an adjusted coefficient is meaningless without the list of what it was adjusted for.
+
+Compare **body mass index**: `r round(row_bmi$estimate, 3)` mmol/L per kg/m² (95% CI `r round(row_bmi$conf.low, 3)` to `r round(row_bmi$conf.high, 3)`, p = `r round(row_bmi$p.value, 3)`). Statistically significant, yes — but a 5 kg/m² difference in BMI, which is a large difference clinically, corresponds to only `r round(5 * row_bmi$estimate, 3)` mmol/L of fasting blood sugar. **Significance and importance are different questions**, and the confidence interval is what lets a reader judge the second.
+
+### Interpreting a categorical covariate
+
+```{r}
+#| label: interp-categorical
+
+row_dm <- t_main |> filter(term == "hx_dm2yes")
+row_chn <- t_main |> filter(term == "racechinese")
+```
+
+For **history of type 2 diabetes**, a two-level factor with "no" as the reference:
+
+> Participants with a history of type 2 diabetes had a mean fasting blood sugar `r round(row_dm$estimate, 3)` mmol/L higher than those without such a history (95% CI `r round(row_dm$conf.low, 3)` to `r round(row_dm$conf.high, 3)`, p `r if (row_dm$p.value < 0.001) "< 0.001" else round(row_dm$p.value, 3)`), after adjustment for the other covariates in the model.
+
+The coefficient is a **difference in means between two groups**, not a rate. The reference group must be named, because "`r round(row_dm$estimate, 3)` mmol/L higher" is meaningless without saying higher *than what*.
+
+Ethnicity, with four levels, produces three coefficients, each a comparison against Malay participants. Chinese participants, for instance, had a mean fasting blood sugar `r round(abs(row_chn$estimate), 3)` mmol/L **lower** than Malay participants (95% CI `r round(row_chn$conf.low, 3)` to `r round(row_chn$conf.high, 3)`). Change the reference level and all three coefficients change, while the model's predictions do not — which is why the reference must be stated in the table footnote.
+
+## The model with interaction, all observations
+
+This is the model selected in Section [-@sec-anova] and revised in Section [-@sec-resid-omitted], fitted on every available observation.
+
+```{r}
+#| label: model-labels
+
+# One label set, reused by the two interaction-model tables below.
+lab_revised <- list(
+  ruralurban ~ "Residence",
+  race ~ "Ethnicity",
+  age ~ "Age (years)",
+  bmi ~ "Body mass index (kg/m2)",
+  whr ~ "Waist-hip ratio",
+  sbp1 ~ "Systolic BP (mmHg)",
+  total_cholesterol ~ "Total cholesterol (mmol/L)",
+  fasting_tg ~ "Fasting triglyceride (mmol/L)",
+  hx_dm2 ~ "History of type 2 diabetes",
+  total_bilirubin ~ "Total bilirubin (umol/L)",
+  `age:hx_dm2` ~ "Age x history of type 2 diabetes"
+)
+```
+
+```{r}
+#| label: interaction-table
+
+tbl_int <- m_revised |>
+  tbl_regression(
+    intercept = TRUE,
+    label = lab_revised,
+    estimate_fun = \(x) style_number(x, digits = 3),
+    pvalue_fun = \(x) style_pvalue(x, digits = 3)
+  ) |>
+  modify_column_unhide(column = std.error) |>
+  modify_header(
+    estimate = "**Beta**",
+    std.error = "**SE(Beta)**",
+    conf.low = "**95% CI**",
+    p.value = "**p-value**"
+  ) |>
+  modify_caption(
+    "**Table 17. Multiple linear regression with an age by diabetes-history interaction, all observations.**"
+  ) |>
+  add_glance_source_note(
+    include = c(nobs, r.squared, adj.r.squared, sigma),
+    label = list(nobs ~ "n", sigma ~ "Residual SE")
+  ) |>
+  bold_labels()
+
+tbl_int
+```
+
+## The same model without the severe influential observations
+
+Section [-@sec-assess] identified `r nrow(severe)` observations that are both badly fitted and influential. Refitting without them answers one question: **would the conclusions have been different?**
+
+```{r}
+#| label: sensitivity-model
+
+dat_model <- model.frame(m_revised)
+dat_sens <- dat_model[-severe$observation, ]
+
+m_sens <- lm(formula(m_revised), data = dat_sens)
+
+# Percentage change in each coefficient, relative to the all-observations fit.
+pct_change <- tidy(m_revised) |>
+  select(term, b_all = estimate, p_all = p.value) |>
+  left_join(tidy(m_sens) |> select(term, b_sens = estimate), by = "term") |>
+  mutate(pct = 100 * (b_sens - b_all) / b_all)
+```
+
+```{r}
+#| label: sensitivity-table
+
+tbl_sens <- m_sens |>
+  tbl_regression(
+    intercept = TRUE,
+    label = lab_revised,
+    estimate_fun = \(x) style_number(x, digits = 3),
+    pvalue_fun = \(x) style_pvalue(x, digits = 3)
+  ) |>
+  modify_column_unhide(column = std.error) |>
+  modify_header(
+    estimate = "**Beta**",
+    std.error = "**SE(Beta)**",
+    conf.low = "**95% CI**",
+    p.value = "**p-value**"
+  ) |>
+  bold_labels()
+
+# Attach the percentage-change column by matching on the term name that
+# gtsummary keeps in its internal table body.
+tbl_sens <- tbl_sens |>
+  modify_table_body(
+    ~ .x |>
+      left_join(pct_change |> select(term, pct), by = "term") |>
+      mutate(pct_diff = ifelse(is.na(pct), NA, round(pct, 1)))
+  ) |>
+  modify_header(pct_diff = "**% difference in Beta**") |>
+  modify_column_unhide(column = pct_diff) |>
+  modify_caption(
+    paste0(
+      "**Table 18. The revised interaction model refitted without the ",
+      nrow(severe),
+      " severe influential observations (n = ",
+      nobs(m_sens),
+      ", from ",
+      nobs(m_revised),
+      " in Table 17).** Percentage difference = 100 x (beta here - beta in Table 17) / beta in Table 17. ",
+      "It is unstable for a coefficient close to zero and should be read only for terms clearly different from zero."
+    )
+  ) |>
+  add_glance_source_note(
+    include = c(nobs, r.squared, adj.r.squared, sigma),
+    label = list(nobs ~ "n", sigma ~ "Residual SE")
+  )
+
+tbl_sens
+```
+
+```{r}
+#| label: sensitivity-numbers
+
+pct_sig <- pct_change |> filter(p_all < 0.05, term != "(Intercept)")
+worst_sig <- pct_sig |> slice_max(abs(pct), n = 1)
+sign_flips <- pct_sig |> filter(sign(b_all) != sign(b_sens))
+```
+
+::: {.callout-warning}
+## Read this comparison the right way round
+
+Removing the `r nrow(severe)` observations raises adjusted R² from `r round(summary(m_revised)$adj.r.squared, 4)` to `r round(summary(m_sens)$adj.r.squared, 4)` and cuts the residual standard error from `r round(summary(m_revised)$sigma, 3)` to `r round(summary(m_sens)$sigma, 3)`. **That improvement is mostly an artefact of the deletion itself.** The removed rows were selected for having large residuals, so the residual variance had to fall. A model that fits better because the badly fitted cases were deleted has not learned anything.
+
+The comparison is still worth making, and here is what it says.
+
+- **No conclusion reverses.** Among the terms significant at 5% in Table 17, `r if (nrow(sign_flips) == 0) "not one changes sign" else paste(nrow(sign_flips), "change sign")`.
+- **Effect sizes are sensitive.** The largest change among those terms is `r round(worst_sig$pct, 1)`% for `r worst_sig$term`. Coefficients generally shrink, because the deleted participants are the ones with the most extreme glucose values, and they were pulling the slopes upward.
+- **Percentages on near-null coefficients are noise.** Waist–hip ratio changes by hundreds of percent, but its coefficient is not distinguishable from zero in either fit. A large percentage change on a coefficient whose confidence interval spans zero means nothing.
+- **The heteroscedasticity gets worse, not better.** Breusch–Pagan on the reduced model is p = `r format.pval(bptest(m_sens)$p.value, digits = 3, eps = 2.2e-16)`. Deleting influential points is not a treatment for a violated assumption.
+
+**Table 17 remains the model to report.** Table 18 exists to show that the reported result does not depend on `r round(100 * nrow(severe) / nobs(m_revised), 1)`% of the sample — and to make plain that those `r nrow(severe)` participants, most of them with fasting blood sugar above 15 mmol/L, are precisely the people a study of glycaemia is about.
+:::
+
+### Interpreting the interaction term
+
+```{r}
+#| label: interp-interaction
+
+row_intx_ci <- tidy(m_revised, conf.int = TRUE) |> filter(str_detect(term, ":"))
+```
+
+The interaction coefficient is `r round(row_intx_ci$estimate, 4)` mmol/L per year (95% CI `r round(row_intx_ci$conf.low, 4)` to `r round(row_intx_ci$conf.high, 4)`, p `r fmt_p(row_intx_ci$p.value)`). It is **not** an effect of age, and it is **not** an effect of diabetes history. Written out in full:
+
+> The association between age and mean fasting blood sugar was `r round(abs(row_intx_ci$estimate), 4)` mmol/L per year **more negative** among participants with a history of type 2 diabetes than among those without (95% CI `r round(row_intx_ci$conf.low, 4)` to `r round(row_intx_ci$conf.high, 4)`, p `r fmt_p(row_intx_ci$p.value)`), after adjustment for the other covariates in the model.
+
+Three things make that sentence correct where most interaction sentences are wrong:
+
+- **"more negative ... than"** — the coefficient is a *difference between two slopes*, so both groups must appear in the sentence.
+- **the units are the units of the numerical variable** — mmol/L per year, not mmol/L.
+- **neither main effect can now be read on its own.** The `age` coefficient in Table 17 is the age slope *for the reference group only*, and the `hx_dm2` coefficient is the difference between groups *at age zero*, which no participant has.
+
+Because a difference of slopes is hard to picture, report the slopes.
+
+### Recovering the two age slopes
+
+`emmeans::emtrends()` reports them directly:
+
+```{r}
+#| label: emtrends
+
+age_slopes <- emtrends(m_revised, ~hx_dm2, var = "age")
+slope_tab <- summary(age_slopes, infer = TRUE) |> as_tibble()
+
+slope_tab |>
+  transmute(
+    `History of type 2 diabetes` = hx_dm2,
+    `Age slope (mmol/L per year)` = round(age.trend, 4),
+    `95% CI` = paste0(round(lower.CL, 4), ", ", round(upper.CL, 4)),
+    `p-value` = fmt_p(p.value)
+  ) |>
+  kable(
+    caption = "Table 19. Slope of fasting blood sugar on age, within each level of diabetes history."
+  )
+```
+
+```{r}
+#| label: slope-values
+
+slope_no <- slope_tab |> filter(hx_dm2 == "no")
+slope_yes <- slope_tab |> filter(hx_dm2 == "yes")
+row_intx <- tidy(m_revised) |> filter(str_detect(term, ":"))
+```
+
+```{r}
+#| label: fig-interaction
+#| fig-cap: "Predicted mean fasting blood sugar against age, separately for participants with and without a history of type 2 diabetes, with all other covariates held at their sample median or reference level. Shaded bands are 95% confidence intervals for the mean. The lines are not parallel, which is what interaction means."
+#| fig-height: 4
+
+pred_grid <- expand_grid(
+  age = seq(
+    min(dat$age, na.rm = TRUE),
+    max(dat$age, na.rm = TRUE),
+    length.out = 100
+  ),
+  hx_dm2 = levels(dat$hx_dm2)
+) |>
+  mutate(
+    hx_dm2 = factor(hx_dm2, levels = levels(dat$hx_dm2)),
+    ruralurban = factor("rural", levels = levels(dat$ruralurban)),
+    race = factor("malay", levels = levels(dat$race)),
+    bmi = median(dat$bmi, na.rm = TRUE),
+    whr = median(dat$whr, na.rm = TRUE),
+    sbp1 = median(dat$sbp1, na.rm = TRUE),
+    total_cholesterol = median(dat$total_cholesterol, na.rm = TRUE),
+    fasting_tg = median(dat$fasting_tg, na.rm = TRUE),
+    total_bilirubin = median(dat$total_bilirubin, na.rm = TRUE)
+  )
+
+pred_ci <- predict(m_revised, newdata = pred_grid, interval = "confidence") |>
+  as_tibble()
+
+bind_cols(pred_grid, pred_ci) |>
+  ggplot(aes(x = age, y = fit, colour = hx_dm2, fill = hx_dm2)) +
+  geom_ribbon(aes(ymin = lwr, ymax = upr), alpha = 0.18, colour = NA) +
+  geom_line(linewidth = 0.9) +
+  labs(
+    x = "Age (years)",
+    y = "Predicted mean fasting blood sugar (mmol/L)",
+    colour = "History of\ntype 2 diabetes",
+    fill = "History of\ntype 2 diabetes"
+  )
+```
+
+The two lines run in opposite directions:
+
+> Among participants with no history of type 2 diabetes, mean fasting blood sugar rose by `r round(slope_no$age.trend, 4)` mmol/L per year of age (95% CI `r round(slope_no$lower.CL, 4)` to `r round(slope_no$upper.CL, 4)`). Among those with a history of type 2 diabetes it **fell** by `r round(abs(slope_yes$age.trend), 4)` mmol/L per year (95% CI `r round(slope_yes$lower.CL, 4)` to `r round(slope_yes$upper.CL, 4)`). The difference between the two slopes, which is the interaction coefficient, was `r round(row_intx$estimate, 4)` mmol/L per year (p `r if (row_intx$p.value < 0.001) "< 0.001" else round(row_intx$p.value, 3)`).
+
+::: {.callout-note}
+## Interpretation, and a hypothesis clearly labelled as one
+
+A falling age gradient within the group that has diabetes looks strange until you remember these are prevalent, mostly treated cases. One **plausible explanation** — and it is a hypothesis, not something these data can establish — is that younger people already diagnosed with type 2 diabetes represent more aggressive early-onset disease with poorer glycaemic control, while older participants with a longer-standing diagnosis have been under treatment for many years. A cross-sectional design cannot distinguish that from a cohort effect, from survival bias, or from differences in treatment intensity by age.
+
+Report the interaction; offer the explanation as a hypothesis; do not write it up as a finding.
+:::
+
+### Reporting practice when an interaction is present
+
+- Report the **stratum-specific slopes** (Table 19), not just the interaction coefficient. Readers can interpret a slope; almost nobody can interpret a difference of slopes on sight.
+- Report the **test of the interaction** — here the `anova()` F-test from Section [-@sec-anova] — as the evidence that the effect differs, and quote it once.
+- **Never report an overall "effect of age"** from a model containing `age:hx_dm2`. There is no single effect of age in that model. That is the entire point of including the term.
+
+# P — Publish {#sec-publish}
+
+The last step is making the analysis reachable by other people — including yourself in six months. An analysis that lives only in one person's `Documents` folder is not reproducible in any useful sense.
+
+::: {.callout-important}
+## The code below is not executed
+
+Every chunk in this section is marked `eval: false`. It is documentation of the workflow, and nothing in this document creates a repository, makes a commit, or pushes anything anywhere. Run these commands yourself when you are ready.
+:::
+
+## Setting up the repository
+
+```{bash}
+#| eval: false
+#| filename: "Terminal"
+
+# from the project root, once
+git init
+git branch -M main
+```
+
+A `.gitignore` keeps clutter and anything confidential out of the repository:
+
+```{bash}
+#| eval: false
+#| filename: ".gitignore"
+
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+/.quarto/
+```
+
+::: {.callout-warning}
+## Do not ignore the `_files/` folder
+
+Many R `.gitignore` templates include a line for `*_files/`. **Do not use it here.** This document is rendered with `embed-resources: false`, which means the HTML is *not* self-contained: the figures and the JavaScript that powers the interactive tables live in `mssm_linear_regression_practical_files/`. Ignore that folder and the published page loses every image and every sortable table.
+
+The alternative is to set `embed-resources: true` in the YAML, which bundles everything into one large HTML file. Then a single file is all you need to commit — but you no longer have the figures as separate PNGs to drop into a slide deck or a manuscript. Pick one and be consistent.
+:::
+
+## The first commit and the remote
+
+```{bash}
+#| eval: false
+#| filename: "Terminal"
+
+git add .
+git commit -m "Add MSSM linear regression practical"
+
+git remote add origin https://github.com/drkamarul/linear_regression_2026.git
+git push -u origin main
+```
+
+## Publishing the rendered document
+
+Quarto can publish the rendered HTML to GitHub Pages in one command:
+
+```{bash}
+#| eval: false
+#| filename: "Terminal"
+
+quarto publish gh-pages practical/mssm_linear_regression_practical.qmd
+```
+
+This creates a `gh-pages` branch, pushes the rendered output there, and enables GitHub Pages, so the document becomes a URL that colleagues and students can open in a browser.
+
+::: {.callout-warning}
+## Decide about the data before you push
+
+`git push` is difficult to undo: once a file has been pushed to a public repository, it may be cached, forked or indexed even after you delete it. Before pushing, decide deliberately:
+
+- **May the dataset be shared publicly?** Human-subject data usually may not, without explicit ethics approval and consent covering open sharing. If in doubt, add `dataset/` to `.gitignore` and publish only the code, with instructions for obtaining the data.
+- **Does the document contain anything identifiable?** Tables of extreme observations, like Tables 14 and 15 above, print individual participants' values. In this dataset that is not identifiable, but in a smaller sample it could be.
+- **Is the repository meant to be public or private?** Start private. Making a repository public later is one click; unpublishing is not.
+:::
+
+## Reproducibility
+
+Two further habits are worth the small effort:
+
+- **Record the environment.** `sessionInfo()` at the end of the document (Section [-@sec-session]) states which R version and which package versions produced these numbers. Package updates change defaults, and a result you cannot reproduce is a result you cannot defend.
+- **Consider `renv`.** `renv::init()` records the exact package versions in a lockfile that a collaborator can restore with `renv::restore()`, which makes the analysis reproducible in a stronger sense than `sessionInfo()` alone.
+
+# Summary
+
+What this practical did, in the order it did it:
+
+1. **Read** the MSSM data, cleaned the column names, derived body mass index and waist–hip ratio, and set every factor's reference level explicitly.
+2. **Explored** the data with a descriptive table and box-and-whisker plots, and flagged three data-quality issues without acting on any of them.
+3. **Assumed** — did not test — that fasting blood sugar is conditionally Gaussian with constant variance.
+4. **Applied** eighteen simple linear regressions through one `purrr` sweep, screened at p < 0.20, built a main-effect model on substantive grounds without any automated selection, added two pre-specified interaction terms, and compared the models with nested F-tests.
+5. **Assessed** the chosen model against the LINE conditions and found that normality and equal variance both fail; screened the residuals against every variable *left out* of the model, which put total bilirubin back in; and listed the `r nrow(outlier_tab)` severe outliers and the `r nrow(severe)` severe influential observations against a stated, defended rule.
+6. **Presented** three coefficient tables — main effects, the revised interaction model, and that model refitted without the severe influentials with the percentage change in every coefficient — interpreted one numerical covariate, one categorical covariate and the interaction term in full sentences, and recovered the two stratum-specific age slopes.
+7. **Published** — documented how, and flagged what to decide before pushing human-subject data anywhere public.
+
+Four things are worth carrying away. **The tidy sweep in Section [-@sec-slr] is the reason eighteen regressions cost no more effort than one** — once model output is a data frame, it is just data. **Adjustment can eliminate an association entirely**, as age's crude p-value of `r signif(p_age_crude, 2)` becoming `r round(row_age$p.value, 3)` demonstrates. **The assessment step is not a formality**: it found two failed assumptions that a reader is entitled to know about, and it changed the model — a variable passed over at the crude stage turned out to carry information the fitted model had missed, and only the residual plots could have said so. And **a sensitivity analysis is a disclosure, not a repair**: the `r nrow(severe)` most awkward observations were refitted without, reported beside the full model, and put back.
+
+For the theory behind every step here — least squares, the meaning of R-squared, why transformation is justified by diagnostics rather than by fit, and what to do when the assumptions fail — see the chapter, *Linear Regression Analysis in Health and Medicine*.
+
+# References {#sec-references}
+
+The seven substantive references below were used to justify the covariate set in Section [-@sec-mlr] and to place the bilirubin term of Section [-@sec-resid-omitted] against the published literature. Each was verified on PubMed — authors, title, journal, year and DOI — before being cited. The software references cover the tools used throughout [@rcore; @tidyverse; @gtsummary].
+
+::: {#refs}
+:::
+
+# Session information {#sec-session}
+
+```{r}
+#| label: session-info
+
+sessionInfo()
+```

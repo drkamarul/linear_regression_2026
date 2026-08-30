@@ -1,0 +1,2045 @@
+---
+title: "Linear Regression Analysis in Health and Medicine"
+author:
+  - name: Kamarul Imran Musa
+    affiliations:
+      - name: School of Medical Sciences, Universiti Sains Malaysia
+date: last-modified
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    embed-resources: true
+    fig-width: 7
+    fig-height: 4.5
+    fig-align: center
+    tbl-cap-location: top
+    code-tools: false
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    dev: "png"
+    dpi: 150
+---
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(readxl)
+library(janitor)
+library(broom)
+library(gtsummary)
+library(gt)
+library(knitr)
+library(kableExtra)
+library(car)
+library(lmtest)
+library(emmeans)
+library(patchwork)
+
+theme_set(theme_minimal(base_size = 11))
+theme_gtsummary_compact()
+
+# ---- fixed formatting helpers -------------------------------------------------
+# Used so that every number quoted in the prose is generated from the fitted
+# object, never typed by hand.
+fmt   <- function(x, d = 3) formatC(x, format = "f", digits = d)
+fmt_p <- function(p) ifelse(p < 0.001, "< 0.001", formatC(p, format = "f", digits = 3))
+# p-values so small that a rounded value is uninformative
+fmt_psci <- function(p) {
+  if (p < 1e-300) return("&lt; 1 &times; 10<sup>-300</sup>")
+  e <- floor(log10(p)); m <- round(p / 10^e, 1)
+  paste0(m, " &times; 10<sup>", e, "</sup>")
+}
+b  <- function(m, term, d = 4) fmt(coef(m)[term], d)
+ci <- function(m, term, d = 4) {
+  k <- confint(m)[term, ]
+  paste0(fmt(k[1], d), " to ", fmt(k[2], d))
+}
+pv <- function(m, term) fmt_p(summary(m)$coefficients[term, 4])
+```
+
+```{r}
+#| label: data
+
+# Path is relative to this document: chapter/ sits alongside dataset/
+mssm_raw <- read_excel(file.path("..", "dataset", "mssm_fasting_blood_sugar.xlsx"))
+
+mssm <- mssm_raw |>
+  clean_names() |>
+  mutate(
+    # Derived anthropometric indices
+    bmi = weight_kg / (height_m^2),          # kg/m^2
+    whr = waist_cm / hip_circum_cm,          # unitless ratio
+    ruralurban = factor(ruralurban, levels = c("rural", "urban"),
+                        labels = c("Rural", "Urban")),
+    malefemale = factor(malefemale, levels = c("female", "male"),
+                        labels = c("Female", "Male")),
+    race       = factor(race, levels = c("malay", "chinese", "indian", "other"),
+                        labels = c("Malay", "Chinese", "Indian", "Other")),
+    marital    = factor(marital, levels = c("married", "single"),
+                        labels = c("Married", "Single")),
+    hx_dm2     = factor(hx_dm2, levels = c("no", "yes"),
+                        labels = c("No", "Yes"))
+  )
+
+# Variable labels used by every gtsummary table in the chapter
+var_labels <- list(
+  fasting_blood_sugar = "Fasting blood sugar (mmol/L)",
+  age                 = "Age (years)",
+  height_m            = "Height (m)",
+  weight_kg           = "Weight (kg)",
+  waist_cm            = "Waist circumference (cm)",
+  neck_circum_cm      = "Neck circumference (cm)",
+  hip_circum_cm       = "Hip circumference (cm)",
+  bmi                 = "Body mass index (kg/m²)",
+  whr                 = "Waist-hip ratio",
+  sbp1                = "Systolic blood pressure (mmHg)",
+  dbp1                = "Diastolic blood pressure (mmHg)",
+  total_bilirubin     = "Total bilirubin (umol/L)",
+  total_cholesterol   = "Total cholesterol (mmol/L)",
+  fasting_tg          = "Fasting triglyceride (mmol/L)",
+  ruralurban          = "Residence",
+  malefemale          = "Sex",
+  race                = "Ethnicity",
+  marital             = "Marital status",
+  hx_dm2              = "History of diabetes"
+)
+
+covariates <- c("age", "height_m", "weight_kg", "waist_cm", "neck_circum_cm",
+                "hip_circum_cm", "bmi", "whr", "sbp1", "dbp1", "total_bilirubin",
+                "total_cholesterol", "fasting_tg", "ruralurban", "malefemale",
+                "race", "marital", "hx_dm2")
+
+n_total <- nrow(mssm)
+n_cov   <- length(covariates)
+```
+
+```{r}
+#| label: models
+
+# ---- simple linear regression: the two worked examples -----------------------
+m_bmi <- lm(fasting_blood_sugar ~ bmi,     data = mssm)
+m_mar <- lm(fasting_blood_sugar ~ marital, data = mssm)
+
+# ---- the multivariable model that carries sections 5 to 8 --------------------
+# Adiposity is represented by BMI and waist-hip ratio. Waist circumference is
+# deliberately excluded: see the multicollinearity section, where the model
+# containing all three is fitted to show what happens.
+f_mlr <- fasting_blood_sugar ~ ruralurban + race + age + bmi + whr + sbp1 +
+  total_cholesterol + fasting_tg + hx_dm2
+
+m_mlr <- lm(f_mlr, data = mssm)
+
+# reduced model for the general linear F-test (race, a 3 df block)
+m_no_race <- lm(update(f_mlr, . ~ . - race), data = m_mlr$model)
+
+# the same model with waist circumference added back, used only to demonstrate
+# multicollinearity among three overlapping measures of adiposity
+m_mlr_waist <- lm(update(f_mlr, . ~ . + waist_cm), data = mssm)
+
+# ---- transformation models ---------------------------------------------------
+m_log_tg  <- lm(update(f_mlr, . ~ . - fasting_tg + log2(fasting_tg)), data = mssm)
+m_log_fbs <- lm(update(f_mlr, log(fasting_blood_sugar) ~ .), data = mssm)
+
+# ---- interaction models ------------------------------------------------------
+m_int_cat  <- lm(update(f_mlr, . ~ . + age:hx_dm2),     data = mssm)
+m_int_cont <- lm(update(f_mlr, . ~ . + whr:fasting_tg), data = mssm)
+
+# candidates examined for a numerical-by-numerical interaction, in the order
+# they were specified before any were fitted
+int_search <- tibble::tribble(
+  ~pair,                          ~formula_term,
+  "BMI x triglyceride",           "bmi:fasting_tg",
+  "BMI x total cholesterol",      "bmi:total_cholesterol",
+  "Waist-hip ratio x triglyceride", "whr:fasting_tg"
+) |>
+  mutate(res = map(formula_term, function(tm) {
+    mi <- lm(update(f_mlr, as.formula(paste0(". ~ . + ", tm))), data = mssm)
+    a  <- anova(m_mlr, mi)
+    tibble(f = a$F[2], p = a$`Pr(>F)`[2])
+  })) |>
+  unnest(res)
+
+n_mlr <- nobs(m_mlr)
+
+# name R gives the interaction term (it orders factors as they appear)
+tm_cont <- grep(":", names(coef(m_int_cont)), value = TRUE)
+```
+
+```{r}
+#| label: helpers
+
+# Diagnostic panels, built directly in ggplot2. performance::check_model() is
+# deliberately avoided because the `see` package is not available here.
+aug_of <- function(model) {
+  broom::augment(model) |>
+    mutate(.stdresid = rstandard(model))
+}
+
+p_resid_fit <- function(model, title = "Residuals vs fitted values") {
+  aug_of(model) |>
+    ggplot(aes(.fitted, .resid)) +
+    geom_point(alpha = 0.18, size = 0.7) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey30") +
+    geom_smooth(method = "loess", se = FALSE, colour = "#C0392B", linewidth = 0.7) +
+    labs(x = "Fitted value (mmol/L)", y = "Residual (mmol/L)", title = title)
+}
+
+p_qq <- function(model, title = "Normal probability plot of residuals") {
+  aug_of(model) |>
+    ggplot(aes(sample = .stdresid)) +
+    stat_qq(alpha = 0.25, size = 0.7) +
+    stat_qq_line(colour = "#C0392B", linewidth = 0.7) +
+    labs(x = "Theoretical quantile", y = "Standardised residual", title = title)
+}
+
+p_scale_loc <- function(model, title = "Scale-location plot") {
+  aug_of(model) |>
+    ggplot(aes(.fitted, sqrt(abs(.stdresid)))) +
+    geom_point(alpha = 0.18, size = 0.7) +
+    geom_smooth(method = "loess", se = FALSE, colour = "#C0392B", linewidth = 0.7) +
+    labs(x = "Fitted value (mmol/L)",
+         y = expression(sqrt(abs("standardised residual"))), title = title)
+}
+
+# Residuals joined back onto the full dataset, so that they can be plotted
+# against variables that are NOT in the model. lm() drops incomplete rows, so
+# the join is made on the original row indices carried by the residual names.
+resid_with_data <- function(model) {
+  mssm |>
+    mutate(.row = row_number()) |>
+    inner_join(
+      tibble(.row   = as.integer(names(residuals(model))),
+             .resid = as.numeric(residuals(model))),
+      by = ".row"
+    )
+}
+
+p_resid_vs <- function(model, var, xlab, title = NULL) {
+  resid_with_data(model) |>
+    ggplot(aes(.data[[var]], .resid)) +
+    geom_point(alpha = 0.18, size = 0.7) +
+    geom_hline(yintercept = 0, linetype = 2, colour = "grey30") +
+    geom_smooth(method = "loess", se = FALSE, colour = "#C0392B", linewidth = 0.7) +
+    labs(x = xlab, y = "Residual (mmol/L)", title = title)
+}
+```
+
+# Objectives
+
+<!-- The author will insert the learning objectives for this chapter here. -->
+
+*To be supplied.*
+
+# Introduction {#sec-introduction}
+
+A great deal of what health researchers measure is continuous. Blood pressure, body mass index, glycated haemoglobin, lung function, birth weight, serum cholesterol, quality-of-life scores, length of hospital stay — these are the quantities on which clinical decisions are made, populations are compared and interventions are judged. Linear regression is the standard method for analysing them, and it is the foundation on which almost every other regression model in health research is built.
+
+## Why linear regression matters in health research
+
+The appeal of linear regression begins with a limitation of simpler methods. A $t$-test can compare mean blood pressure between two groups, and a correlation coefficient can quantify the association between body mass index and blood pressure. Neither can answer the question that actually arises in practice: *how much* does blood pressure differ per unit of body mass index, among people who are otherwise similar in age, sex and physical activity? Linear regression answers precisely that. It expresses an association as an interpretable quantity in the units of the outcome, attaches a confidence interval to it, and adjusts it for other measured variables simultaneously.
+
+That capacity for **adjustment** is what makes regression indispensable in epidemiology. Observational health data are confounded almost by definition: people who differ in one exposure differ in many others. A crude comparison of fasting blood sugar between urban and rural residents confuses residence with the age structure, diet, obesity and socioeconomic position of the two populations. Multiple linear regression estimates the difference associated with residence *among participants alike in the measured covariates*, which is the closest an observational analysis can come to the comparison a randomised trial would deliver. @sec-crude-adjusted of this chapter shows how consequential this can be, with an association that is highly significant before adjustment and entirely absent after it.
+
+Linear regression matters for a second reason that has nothing to do with linear regression specifically. Logistic regression for binary outcomes, Poisson regression for counts, Cox regression for survival times and mixed-effects models for grouped data are all extensions of the same framework. The concepts developed here — the regression equation, the partial coefficient, adjustment, indicator variables, interaction, model diagnostics — transfer directly. A reader who understands linear regression thoroughly has already learned most of what the others require.
+
+The final reason is professional rather than technical. Regression results dominate the medical literature, and they are frequently misreported. A survey of a full year of papers in the *BMJ*, *The Lancet* and the *New England Journal of Medicine* identified fifteen distinct categories of error in the use of correlation and regression, among them the omission of confidence intervals, over-reliance on $p$-values, and unclear reporting of sample size (Porter, 1999). Critically appraising such analyses is a core competency for a doctoral graduate in public health, and it requires knowing not only how the models are fitted but how they fail.
+
+## Four use-cases in medicine, health and public health
+
+### 1. Quantifying a dose–response relationship
+
+The most direct use of linear regression is to express how much a continuous outcome changes per unit of a continuous exposure. Doll and colleagues (2002) modelled systolic and diastolic blood pressure against body mass index, waist circumference and waist-to-hip ratio in 3,116 adults in the Seychelles and Switzerland, adjusting for age. Because the regression coefficient is a rate of change, their findings could be stated in directly usable terms: in men, an increase of 1.7 kg/m² in body mass index, or of 4.5 cm in waist circumference, corresponded to a rise of 1 mmHg in systolic blood pressure; in women the corresponding figures were 1.25 kg/m² and 2.5 cm.
+
+This is regression doing what no dichotomised analysis can. Splitting body mass index into "obese" and "not obese" would discard the gradient entirely and reduce statistical power, a cost quantified by Altman and Royston (2006). The graded, continuous nature of the adiposity–blood pressure relationship was established in exactly this way by the Framingham investigators decades earlier (Kannel et al., 1967).
+
+### 2. Adjusting for confounding in observational studies
+
+The second use-case is adjustment, and its effects are often dramatic. Law and colleagues (2001) examined the relationship between size at birth and childhood blood pressure in 1,570 children aged three to six years across five countries. Blood pressure was positively related to the child's *current* weight, and it was only after regression adjustment for current weight and sex that the inverse association between birth weight and systolic pressure became clear: in Chile, adjusted systolic pressure rose by 4.9 mmHg (95% CI 2.1 to 7.7) for each kilogram *decrease* in birth weight.
+
+Here adjustment did not merely refine an estimate — it revealed an association that the unadjusted analysis obscured. It also illustrates why adjustment demands subject-matter judgement rather than statistical routine, since whether current weight is a confounder or a variable on the causal pathway determines whether adjusting for it is appropriate at all. That distinction recurs throughout @sec-mlr.
+
+### 3. Deriving reference values and prediction equations
+
+Much of clinical medicine depends on knowing what is normal for a given patient, and reference standards are built by regression. The Global Lung Function Initiative derived spirometry reference equations from nearly 100,000 records on healthy non-smokers across 33 countries, modelling forced expiratory volume and forced vital capacity as continuous functions of age, height, sex and ethnicity (Quanjer et al., 2012). The resulting equations, and the lower limits of normal derived from them, are now the international standard for interpreting a spirometry result.
+
+The same approach underlies the estimation of kidney function. The CKD-EPI equation was developed by regressing log-transformed measured glomerular filtration rate on serum creatinine, age, sex and race in 8,254 participants, then validating it in an independent sample of 3,896 (Levey et al., 2009). Every laboratory report of an estimated GFR is the output of a fitted regression equation. Note in both examples the use of a logarithmic transformation of the outcome, the technique developed in @sec-transformation.
+
+### 4. Evaluating interventions on a continuous endpoint
+
+The fourth use-case is the analysis of trials and programme evaluations whose endpoint is continuous. The DASH trial randomised 459 adults to a control diet, a fruit-and-vegetable diet, or a combination diet, holding sodium intake and body weight constant (Appel et al., 1997). The combination diet lowered systolic blood pressure by 5.5 mmHg and diastolic by 3.0 mmHg more than the control diet, with substantially larger effects of 11.4 and 5.5 mmHg among participants with hypertension.
+
+Randomisation removes confounding, so why use regression at all? Because adjusting the follow-up measurement for its own baseline value increases precision considerably, and because analysis of covariance — regression of the follow-up outcome on the baseline value plus the treatment indicator — is statistically preferable to comparing change scores or follow-up values alone (Vickers & Altman, 2001). The subgroup difference in the DASH results is also an instance of the phenomenon formalised in @sec-interaction: the effect of the intervention depended on baseline hypertension status.
+
+## What this chapter covers
+
+The chapter develops the method in the order in which it is used. @sec-slr introduces simple linear regression, least squares estimation, and the coefficient of determination with its many pitfalls. @sec-slr-assessment shows how to check whether a fitted model is trustworthy. @sec-mlr extends the model to several predictors, which brings adjustment, indicator variables and the general linear F-test. @sec-mlr-assessment applies the diagnostic machinery to the multivariable case and adds formal tests for normality and constant variance. @sec-transformation addresses what to do when the assumptions fail. @sec-interaction relaxes the assumption that a covariate's effect is the same for everyone.
+
+Throughout, the same dataset is used and the same outcome is modelled, so that each technique is seen to build on the last. The analyses are real: where the data behave awkwardly, the awkwardness is reported rather than smoothed over, because recognising and handling such situations is the skill this chapter exists to teach.
+
+# Simple Linear Regression {#sec-slr}
+
+Regression analysis begins with the simplest useful case: one continuous outcome and one predictor. Almost everything that follows in this chapter — adjustment for confounding, diagnostic checking, transformation, interaction — is an extension of machinery that is easiest to see, and easiest to get wrong, in this two-variable setting. This section develops that machinery and applies it to a real survey dataset.
+
+## The working dataset {#sec-data}
+
+Every worked example in this chapter uses data from the **Metabolic Syndrome Study for Malaysia (MSSM)**, a community-based survey of adults. Each record is one adult participant. The survey collected sociodemographic information, anthropometric measurements, resting blood pressure, a panel of fasting venous blood investigations, and self-reported medical history. The dataset contains `r n_total` records.
+
+The outcome variable throughout is **fasting blood sugar (FBS)**, measured in mmol/L. FBS is a natural teaching outcome for linear regression: it is continuous, it is clinically meaningful at the individual level, and it is the measurement on which the diagnosis of diabetes mellitus partly rests.
+
+### Two derived covariates {#sec-derived}
+
+Two of the covariates used in this chapter are not measured directly but **derived** from measurements that are. Both are standard indices of adiposity in metabolic research, and each captures a different aspect of body habitus.
+
+**Body mass index (BMI)** expresses weight relative to height and is a measure of *overall* adiposity:
+
+$$
+\text{BMI} = \frac{\text{weight in kilograms}}{(\text{height in metres})^2} \qquad \text{units: kg/m}^2
+$$
+
+**Waist–hip ratio (WHR)** compares abdominal with gluteofemoral girth and is a measure of *central* fat distribution:
+
+$$
+\text{WHR} = \frac{\text{waist circumference in cm}}{\text{hip circumference in cm}} \qquad \text{(unitless)}
+$$
+
+The distinction matters clinically. Two people with identical BMI may differ substantially in where that mass is carried, and central adiposity is the more strongly implicated in insulin resistance. Because the two indices measure different things, they are only weakly correlated with each other in these data ($r$ = `r fmt(cor(mssm$bmi, mssm$whr), 2)`), which means both can be entered into a model without difficulty. Both are, however, strongly related to waist circumference itself ($r$ = `r fmt(cor(mssm$bmi, mssm$waist_cm), 2)` for BMI and `r fmt(cor(mssm$whr, mssm$waist_cm), 2)` for WHR), a fact that becomes important in @sec-multicollinearity.
+
+Deriving a variable does not exempt it from scrutiny. BMI here ranges from `r fmt(min(mssm$bmi), 1)` to `r fmt(max(mssm$bmi), 1)` kg/m², and WHR from `r fmt(min(mssm$whr), 2)` to `r fmt(max(mssm$whr), 2)`. The single WHR value above 1.5 is physiologically extreme and most likely reflects a measurement or recording error; it is reported here rather than silently removed, and its influence is assessed in @sec-assessing along with all other observations.
+
+@tbl-descriptive describes the outcome and the `r n_cov` candidate covariates used in this chapter.
+
+```{r}
+#| label: tbl-descriptive
+#| tbl-cap: "Characteristics of participants in the MSSM dataset. Continuous variables are summarised as mean (SD) and median (IQR); categorical variables as n (%). The number of missing observations is reported for every variable."
+
+mssm |>
+  select(fasting_blood_sugar, all_of(covariates)) |>
+  tbl_summary(
+    label = var_labels,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd}); {median} ({p25}-{p75})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    missing = "always",
+    missing_text = "Missing"
+  ) |>
+  modify_header(label = "**Variable**", stat_0 = "**N = {N}**") |>
+  as_gt() |>
+  gt::tab_options(table.font.size = gt::pct(88))
+```
+
+Two features of @tbl-descriptive deserve attention before any model is fitted, because both shape the analysis later.
+
+First, **the outcome is markedly skewed to the right**. The mean FBS of `r fmt(mean(mssm$fasting_blood_sugar), 2)` mmol/L exceeds the median of `r fmt(median(mssm$fasting_blood_sugar), 2)` mmol/L, and values extend to `r fmt(max(mssm$fasting_blood_sugar), 2)` mmol/L, giving a skewness coefficient of `r fmt(mean(scale(mssm$fasting_blood_sugar)^3), 2)`. This is not a data error. It is the expected shape for a glycaemic measurement in a general adult population: most participants cluster in a narrow normoglycaemic range, while a minority with impaired glucose regulation or established diabetes generate a long upper tail. This skew will have visible consequences in @sec-slr-assessment and @sec-mlr-assessment.
+
+Second, **the data are almost complete**. The outcome is recorded for every one of the `r n_total` participants, as are age, sex, ethnicity, residence, all anthropometric measurements, blood pressure and fasting triglyceride. Only a few variables have any missing values at all, the largest among those used here being total bilirubin. All analyses use complete-case analysis, the default behaviour of the `lm()` function in R: any record missing the outcome or any covariate in a given model is excluded from that model. The sample size is therefore reported for every model fitted. With so little missingness the choice of missing-data method is inconsequential here, but that is a property of this dataset rather than a general licence — complete-case analysis is unbiased only when data are missing completely at random, and in datasets with substantial missingness that assumption deserves explicit examination.
+
+## What simple linear regression is
+
+Simple linear regression summarises the relationship between two continuous variables. One variable is treated as the **outcome**, and the other as the **predictor**.
+
+::: {.callout-note}
+## Definition: simple linear regression
+
+Simple linear regression is a statistical method for summarising and studying the relationship between two continuous variables, in which one variable, denoted $x$, is regarded as the **predictor**, **explanatory** or **independent** variable, and the other, denoted $y$, is regarded as the **response**, **outcome** or **dependent** variable.
+:::
+
+The method is called *simple* because it involves exactly one predictor. When two or more predictors are used, the method becomes multiple linear regression, the subject of @sec-mlr. Two points of vocabulary matter for the rest of the chapter.
+
+The word **linear** refers to linearity in the *parameters*, not to a requirement that a scatter plot look like a straight line. A model containing $x^2$ or $\log x$ as a predictor is still a linear model, because the unknown parameters enter additively and are multiplied by known quantities. This is why the transformations in @sec-transformation remain within the linear regression framework rather than departing from it.
+
+The word **regression** signals that the object being estimated is a *conditional mean*. Simple linear regression does not claim that FBS is a deterministic function of body mass index. It claims something weaker and far more useful: that the **average** FBS among people who share a given body mass index changes in a systematic way as that body mass index changes. Individual variation about that average is expected and is modelled explicitly.
+
+The predictor need not be continuous. A binary predictor such as rural versus urban residence is entirely admissible, and @sec-slr-application works through such an example. What the *outcome* may be is more restricted: ordinary linear regression assumes a continuous outcome whose conditional distribution is approximately normal with constant variance. Binary and count outcomes require the related models named at the end of this chapter.
+
+## The best fitting line
+
+Suppose FBS is plotted against body mass index for every participant. Many straight lines could be drawn through the resulting cloud of points. The task is to choose one, which requires a definition of what makes a line good.
+
+For a candidate line, the **prediction error** for participant $i$ is the vertical distance between the observed outcome and the value the line predicts:
+
+$$
+e_i = y_i - \hat{y}_i
+$$
+
+where $y_i$ is the observed outcome and $\hat{y}_i$ is the predicted, or fitted, value. A natural objective is to make these errors collectively small. Simply summing them fails, because positive and negative errors cancel: a line lying far from every point can achieve a sum of zero. Two repairs are available — summing absolute errors, or summing squared errors.
+
+The **method of least squares** takes the second option. It selects the values of the intercept and slope that minimise the sum of the squared prediction errors:
+
+$$
+Q = \sum_{i=1}^{n} (y_i - \hat{y}_i)^2 = \sum_{i=1}^{n} \left( y_i - (b_0 + b_1 x_i) \right)^2
+$$
+
+::: {.callout-note}
+## Definition: the least squares line
+
+The least squares line is the line $\hat{y} = b_0 + b_1 x$ for which the sum of the squared vertical distances between the observed outcomes and the fitted values is smaller than for any other line.
+:::
+
+Squaring rather than taking absolute values is partly a matter of mathematical convenience — the squared criterion is differentiable, and minimising it yields closed-form estimators:
+
+$$
+b_1 = \frac{\sum_{i=1}^{n}(x_i - \bar{x})(y_i - \bar{y})}{\sum_{i=1}^{n}(x_i - \bar{x})^2},
+\qquad
+b_0 = \bar{y} - b_1 \bar{x}
+$$
+
+The second expression carries a useful geometric fact: **the least squares line always passes through the point $(\bar{x}, \bar{y})$**. It also has a statistical consequence worth remembering — because errors are squared, observations far from the bulk of the data influence the fitted line disproportionately. A single extreme observation can move the line appreciably, which is why the diagnostic work of @sec-slr-assessment is not optional.
+
+Least squares is not the only estimation method. Maximum likelihood estimation is the alternative, and under the normal-error model described next the two coincide for the regression coefficients. Both yield estimators that are unbiased and, among linear unbiased estimators, have minimum variance.
+
+## The simple linear regression model
+
+The least squares line is a description of the sample. To generalise from the sample to the population — to construct confidence intervals and test hypotheses — a probability model is required.
+
+::: {.callout-note}
+## The simple linear regression model
+
+$$
+y_i = \beta_0 + \beta_1 x_i + \epsilon_i, \qquad \epsilon_i \sim N(0, \sigma^2) \ \text{independently}
+$$
+
+where, for the $i$-th observation:
+
+- $y_i$ is the observed outcome;
+- $x_i$ is the observed value of the predictor, treated as fixed and known;
+- $\beta_0$ is the **population intercept**: the mean outcome when $x = 0$;
+- $\beta_1$ is the **population slope**: the change in the mean outcome per one-unit increase in $x$;
+- $\epsilon_i$ is the **error term**, unobservable, with mean $0$ and variance $\sigma^2$.
+:::
+
+Taking expectations of both sides, and noting that $E\{\epsilon_i\} = 0$, gives the **regression function** — the equation for the conditional mean:
+
+$$
+E\{Y_i\} = \beta_0 + \beta_1 x_i
+$$
+
+This equation is the object of inference. The line it describes is the **population regression line**, which connects the mean outcome of each subpopulation defined by a value of $x$. The sample estimates $b_0$ and $b_1$ estimate $\beta_0$ and $\beta_1$; a different sample would give somewhat different estimates, and none would reproduce the population line exactly.
+
+The model asserts four conditions simultaneously. They are conveniently remembered by the mnemonic **LINE**, and each is checked in @sec-slr-assessment.
+
+::: {.callout-note}
+## The LINE conditions
+
+| | Condition | Statement |
+|:--|:--|:-----|
+| **L** | **L**inear | The mean outcome is a linear function of $x$ |
+| **I** | **I**ndependent | The errors are independent of one another |
+| **N** | **N**ormal | The errors are normally distributed at each value of $x$ |
+| **E** | **E**qual variance | The errors have the same variance $\sigma^2$ at every value of $x$ |
+
+Equivalently: the errors $\epsilon_i$ are independent normal random variables with mean zero and constant variance $\sigma^2$.
+:::
+
+These conditions are not equally consequential. Tests and intervals are **very** sensitive to departures from independence, and **moderately** sensitive to unequal variances. Inference about $\beta_0$ and $\beta_1$ is comparatively **robust** to non-normality, particularly in large samples. Prediction intervals, by contrast, are quite sensitive to non-normality. This ordering matters when deciding which diagnostic failures demand action, and it is applied explicitly in @sec-mlr-assessment.
+
+A notational convention is used throughout this chapter and is worth stating once. Greek letters ($\beta_0$, $\beta_1$, $\sigma^2$) denote unknown population parameters. Roman letters and hatted symbols ($b_0$, $b_1$, $\hat{\sigma}$) denote estimates computed from a sample. The fitted regression equation, which is what statistical software reports, is therefore
+
+$$
+\hat{y}_i = b_0 + b_1 x_i
+$$
+
+The error variance is estimated by the **mean squared error**, $\hat{\sigma}^2 = \text{MSE} = \sum e_i^2 / (n - 2)$, whose square root — the residual standard error — expresses the typical size of a prediction error in the units of the outcome. The divisor is $n - 2$ because two parameters have been estimated from the data.
+
+## The coefficient of determination, $R^2$ {#sec-r2}
+
+A fitted line has a slope, and the slope has a $p$-value. Neither answers a question clinicians and reviewers ask immediately: how much of the variation in the outcome does the predictor actually explain? The coefficient of determination answers exactly that, and it is built by partitioning variability.
+
+Consider two ways of predicting a participant's FBS. Knowing nothing about the participant, the best available prediction is the overall mean $\bar{y}$. Knowing the participant's body mass index, the prediction becomes $\hat{y}_i$ from the fitted line. The total deviation of an observation from the overall mean decomposes exactly into the part the line explains and the part it does not:
+
+$$
+\underbrace{(y_i - \bar{y})}_{\text{total}} = \underbrace{(\hat{y}_i - \bar{y})}_{\text{explained by the line}} + \underbrace{(y_i - \hat{y}_i)}_{\text{left unexplained}}
+$$
+
+Remarkably, this identity survives squaring and summing over all observations, giving the fundamental partition of the sums of squares:
+
+$$
+\underbrace{\sum (y_i - \bar{y})^2}_{SST} = \underbrace{\sum (\hat{y}_i - \bar{y})^2}_{SSR} + \underbrace{\sum (y_i - \hat{y}_i)^2}_{SSE}
+$$
+
+$$
+SST = SSR + SSE
+$$
+
+where $SST$ is the **total sum of squares**, $SSR$ the **regression** (explained) **sum of squares**, and $SSE$ the **error** (unexplained) **sum of squares**.
+
+::: {.callout-note}
+## Definition: the coefficient of determination
+
+$$
+R^2 = \frac{SSR}{SST} = 1 - \frac{SSE}{SST}
+$$
+
+$R^2$ is the proportion of the total variation in the outcome that is explained by the regression on the predictor. It is bounded by $0 \le R^2 \le 1$, and is often reported as a percentage.
+:::
+
+### Calculating $R^2$ from the sums of squares
+
+```{r}
+#| label: r2-calc
+
+av_bmi  <- anova(m_bmi)
+ssr_bmi <- av_bmi$`Sum Sq`[1]
+sse_bmi <- av_bmi$`Sum Sq`[2]
+sst_bmi <- ssr_bmi + sse_bmi
+r2_bmi  <- summary(m_bmi)$r.squared
+```
+
+It is worth assembling $R^2$ once by hand, so that the number reported by software is not merely accepted. For the regression of FBS on body mass index, the analysis of variance table gives
+
+$$
+SSR = `r fmt(ssr_bmi, 1)`, \qquad SSE = `r fmt(sse_bmi, 1)`
+$$
+
+so the total sum of squares is
+
+$$
+SST = SSR + SSE = `r fmt(ssr_bmi, 1)` + `r fmt(sse_bmi, 1)` = `r fmt(sst_bmi, 1)`
+$$
+
+and therefore
+
+$$
+R^2 = \frac{SSR}{SST} = \frac{`r fmt(ssr_bmi, 1)`}{`r fmt(sst_bmi, 1)`} = `r fmt(r2_bmi, 4)`
+$$
+
+Body mass index explains `r fmt(100 * r2_bmi, 1)`% of the variation in fasting blood sugar in these data. Equivalently, `r fmt(100 * (1 - r2_bmi), 1)`% of that variation remains unexplained.
+
+The **correlation coefficient** is closely related: $r = \pm\sqrt{R^2}$, taking the sign of the slope. Here the slope is positive, so $r = \sqrt{`r fmt(r2_bmi, 4)`} = `r fmt(sqrt(r2_bmi), 3)`$, which agrees with the directly computed Pearson correlation of `r fmt(cor(mssm$bmi, mssm$fasting_blood_sugar), 3)`. The two quantities carry the same information about strength of association, but they answer different questions: $r$ measures the strength and direction of linear association, while $R^2$ measures proportion of variation explained. Note also that $R^2 = `r fmt(r2_bmi, 4)`$ corresponds to $r = `r fmt(sqrt(r2_bmi), 3)`$ — squaring shrinks a modest correlation into a very small proportion of variance, which is why the two are so often misread against each other.
+
+## Cautions in interpreting $R^2$ {#sec-r2-cautions}
+
+$R^2$ is the most quoted and the most abused number in applied regression. Seven cautions apply, and several are illustrated directly by this chapter's own results.
+
+::: {.callout-warning}
+## Seven cautions in interpreting $R^2$
+
+1. **$R^2$ and $r$ quantify only the strength of a *linear* relationship.** A perfect curved relationship can produce $r = 0$ and $R^2 = 0\%$. A small $R^2$ is therefore evidence against a *linear* association, not against association in general.
+2. **A large $R^2$ does not mean the straight line fits well.** Another functional form may fit considerably better. This is the most common single misuse of $R^2$: a model can explain 90% of the variance and still show obvious curvature in its residuals. Only the diagnostics of @sec-slr-assessment can distinguish the two situations.
+3. **$R^2$ and $r$ can be substantially altered by one or a few observations.** In small datasets, deleting a single point can move $r$ from strongly positive to strongly negative. Influence of this kind must be checked, not assumed absent.
+4. **Association does not imply causation.** This caution turns on study design rather than on statistics. In an **experiment** the investigator sets the values of the predictor; in an **observational study** the investigator only records what occurred. Most regression analyses in health research, including every model in this chapter, use observational data, so causal language is not licensed by any value of $R^2$.
+5. **Ecological correlations overstate the strength of individual-level association.** When the units of analysis are groups — districts, states, countries — and the variables are rates or averages, the resulting correlation is typically much larger than the corresponding correlation between individuals, because aggregation removes within-group variation. An analysis of aggregated data answers a question about groups, not about people.
+6. **A statistically significant $R^2$ does not mean the slope is practically meaningful.** Large samples make it easy to reject the null hypothesis for a slope of negligible size. In these data body mass index explains only `r fmt(100 * r2_bmi, 1)`% of the variance in FBS, yet the slope is very far from zero in statistical terms ($p$ = `r fmt_psci(summary(m_bmi)$coefficients["bmi", 4])`) because `r fmt(nobs(m_bmi), 0)` participants contribute to the estimate.
+7. **A large $R^2$ does not guarantee useful prediction.** Confidence intervals for the mean outcome, and especially prediction intervals for a new individual, may remain far too wide to be clinically actionable. Here the residual standard error is `r fmt(sigma(m_bmi), 2)` mmol/L — large relative to the range over which FBS is clinically interpreted.
+:::
+
+Two further points belong alongside these. First, there is **no universal threshold for a "large" $R^2$**: what counts as substantial depends entirely on the field. In laboratory measurement an $R^2$ of 30% might be unacceptable, whereas in population health research, where outcomes have many determinants, it may represent a strong finding. Second, **$R^2$ never decreases when a predictor is added**, even a predictor consisting of pure noise. Comparing models with different numbers of predictors therefore requires the **adjusted $R^2$**, which divides each sum of squares by its degrees of freedom; this is taken up in @sec-mlr.
+
+The habit to carry into the applied work that follows is straightforward: **report the effect size with its confidence interval, let $R^2$ describe explanatory power, and never allow either to stand in for the other.**
+
+## Application: fasting blood sugar and eighteen candidate covariates {#sec-slr-application}
+
+The MSSM dataset provides `r n_cov` variables that are plausibly associated with fasting blood sugar, including the two derived indices of @sec-derived. A standard first step in a regression analysis is to examine each one separately against the outcome, fitting `r n_cov` simple linear regressions. This is sometimes called univariable or unadjusted screening, and its results are reported in @tbl-slr-all.
+
+```{r}
+#| label: tbl-slr-all
+#| tbl-cap: "Eighteen separate simple linear regressions of fasting blood sugar (mmol/L) on each candidate covariate, ordered by the proportion of variance explained. Each row is a distinct model fitted to all records with complete data on the outcome and that covariate. For multi-category ethnicity no single slope exists, so the p-value is that of the overall F-test for the variable."
+
+slr_one <- function(v) {
+  m <- lm(reformulate(v, response = "fasting_blood_sugar"), data = mssm)
+  g <- glance(m)
+  tt <- tidy(m, conf.int = TRUE) |> filter(term != "(Intercept)")
+  is_block <- nrow(tt) > 1
+  tibble(
+    variable = as.character(var_labels[[v]]),
+    type = if (is.numeric(mssm[[v]])) "Numerical" else "Categorical",
+    contrast = if (is_block) "3 df block" else
+      if (is.numeric(mssm[[v]])) "per 1 unit" else
+        paste0(levels(mssm[[v]])[2], " vs ", levels(mssm[[v]])[1]),
+    beta = if (is_block) NA_real_ else tt$estimate[1],
+    lo   = if (is_block) NA_real_ else tt$conf.low[1],
+    hi   = if (is_block) NA_real_ else tt$conf.high[1],
+    p    = g$p.value,
+    r2   = g$r.squared,
+    n    = g$nobs
+  )
+}
+
+slr_tab <- map_dfr(covariates, slr_one) |> arrange(desc(r2))
+
+slr_tab |>
+  mutate(
+    est = if_else(is.na(beta), "—",
+                  paste0(fmt(beta, 3), " (", fmt(lo, 3), " to ", fmt(hi, 3), ")")),
+    p_fmt = if_else(p < 0.001, "< 0.001", fmt(p, 3)),
+    r2_fmt = fmt(100 * r2, 2)
+  ) |>
+  select(variable, type, contrast, est, p_fmt, r2_fmt, n) |>
+  gt() |>
+  cols_label(variable = "Covariate", type = "Type", contrast = "Contrast",
+             est = "b (95% CI)", p_fmt = "p-value",
+             r2_fmt = "R² (%)", n = "n") |>
+  cols_align("left", columns = c(variable, type, contrast)) |>
+  tab_options(table.font.size = pct(88))
+```
+
+```{r}
+#| label: slr-notes
+n_sig <- sum(slr_tab$p < 0.05)
+r2_next <- max(slr_tab$r2[slr_tab$variable != "History of diabetes"])
+```
+
+@tbl-slr-all repays careful reading, and four lessons emerge.
+
+**`r fmt(n_sig, 0)` of the `r n_cov` covariates are statistically significant, yet almost none explains much variance.** Setting aside history of diabetes, no covariate explains more than `r fmt(100 * r2_next, 1)`% of the variation in FBS. This is caution 6 of @sec-r2-cautions made concrete: with roughly `r fmt(round(median(slr_tab$n)/100)*100, 0)` observations per model, very small associations achieve very small $p$-values. A screening table of this kind identifies candidate variables; it does not rank their importance, and it certainly does not identify causes.
+
+**History of diabetes stands apart.** It explains `r fmt(100 * slr_tab$r2[slr_tab$variable == "History of diabetes"], 1)`% of the variance in FBS — several times more than any other covariate. This is entirely expected and is a warning about interpretation rather than a finding: a self-reported diagnosis of diabetes is not a risk factor for high blood sugar but a consequence of previously measured high blood sugar. The variable is retained in the models that follow because it is a powerful predictor and because adjusting for it makes the remaining coefficients interpretable within diabetic and non-diabetic groups, but no causal reading of its coefficient is available.
+
+**The two derived indices behave differently from each other.** Body mass index explains `r fmt(100 * slr_tab$r2[slr_tab$variable == "Body mass index (kg/m²)"], 2)`% of the variance and waist–hip ratio `r fmt(100 * slr_tab$r2[slr_tab$variable == "Waist-hip ratio"], 2)`%, both smaller than waist circumference alone at `r fmt(100 * slr_tab$r2[slr_tab$variable == "Waist circumference (cm)"], 2)`%. Deriving a variable does not automatically produce a better predictor: BMI discards information about fat distribution, and WHR discards information about overall size. Each is useful for what it measures, not because it is a composite.
+
+**Two covariates show no evidence of association**: residence (`r fmt_p(slr_tab$p[slr_tab$variable == "Residence"])`) and sex (`r fmt_p(slr_tab$p[slr_tab$variable == "Sex"])`), with height marginal. Reporting these honestly is as much a part of the analysis as reporting the significant ones.
+
+The remainder of this section examines two of these `r n_cov` models in full — one with a numerical predictor and one with a categorical predictor. **Body mass index** is chosen as the numerical example: it is a derived variable whose construction was set out in @sec-derived, it is universally understood in health research, and it reappears in the multivariable model of @sec-mlr. **Marital status** is chosen as the categorical example: it has two levels, which makes indicator coding easy to see, and it is significant with a very small effect — the clearest illustration in this dataset of the distinction between statistical and practical significance. These same two models are carried into @sec-slr-assessment for diagnostic checking.
+
+### Worked example A: a numerical predictor {#sec-worked-numerical}
+
+@fig-bmi-scatter shows FBS against body mass index with the least squares line superimposed, and @tbl-bmi reports the fitted model.
+
+```{r}
+#| label: fig-bmi-scatter
+#| fig-cap: "Fasting blood sugar against body mass index in the MSSM dataset, with the least squares regression line and its 95% confidence band. The line summarises the conditional mean; the wide vertical scatter about it shows how much individual variation remains unexplained."
+
+ggplot(mssm, aes(bmi, fasting_blood_sugar)) +
+  geom_point(alpha = 0.16, size = 0.7) +
+  geom_smooth(method = "lm", colour = "#C0392B", fill = "#C0392B", alpha = 0.25) +
+  labs(x = "Body mass index (kg/m²)", y = "Fasting blood sugar (mmol/L)")
+```
+
+```{r}
+#| label: tbl-bmi
+#| tbl-cap: "Simple linear regression of fasting blood sugar (mmol/L) on body mass index (kg/m²)."
+
+tbl_regression(m_bmi, label = list(bmi = "Body mass index (kg/m²)"),
+               intercept = TRUE) |>
+  add_glance_table(include = c(r.squared, adj.r.squared, sigma, nobs)) |>
+  as_gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+The fitted regression equation is
+
+$$
+\widehat{\text{FBS}} = `r fmt(coef(m_bmi)[1], 3)` + `r fmt(coef(m_bmi)[2], 4)` \times \text{BMI}
+$$
+
+Each element has a direct reading:
+
+- The **slope** is `r b(m_bmi, "bmi")` mmol/L per kg/m² (95% CI `r ci(m_bmi, "bmi")`). For every additional unit of body mass index, mean fasting blood sugar is higher by `r b(m_bmi, "bmi")` mmol/L. Because one unit of BMI is a small difference, a more communicable statement rescales it: a BMI higher by 5 kg/m² — roughly the gap between the middle of the normal range and the middle of the overweight range — corresponds to a mean FBS higher by `r fmt(5 * coef(m_bmi)["bmi"], 3)` mmol/L.
+- The **intercept** is `r fmt(coef(m_bmi)[1], 3)` mmol/L, the estimated mean FBS at a body mass index of zero. This has no physical meaning. The intercept here is a mathematical anchor for the line, not a quantity to interpret, because $x = 0$ lies far outside the observed range of `r fmt(min(mssm$bmi), 1)` to `r fmt(max(mssm$bmi), 1)` kg/m². Centring the predictor on its mean would make the intercept interpretable as the mean FBS at average BMI.
+- The **residual standard error** is `r fmt(sigma(m_bmi), 3)` mmol/L, so individual FBS values typically deviate from the fitted line by about that much — a reminder of how weak individual-level prediction is here despite a precisely estimated slope.
+
+**Prediction** follows mechanically from the equation. Substituting a body mass index of 30 kg/m², the conventional threshold for obesity:
+
+$$
+\widehat{\text{FBS}} = `r fmt(coef(m_bmi)[1], 3)` + `r fmt(coef(m_bmi)[2], 4)` \times 30 = `r fmt(predict(m_bmi, data.frame(bmi = 30)), 3)` \ \text{mmol/L}
+$$
+
+This is an estimate of the **mean** FBS among people with a BMI of 30, not a prediction for any individual. Predicting an individual value requires a prediction interval, which is much wider than the confidence interval for the mean because it must also accommodate the residual variation of `r fmt(sigma(m_bmi), 2)` mmol/L. Note also that prediction is only defensible within the observed range of the predictor; extrapolating beyond it assumes the linear relationship continues where no data exist.
+
+### Worked example B: a categorical predictor {#sec-worked-categorical}
+
+When the predictor is categorical, the same algebra applies but the coefficients acquire a different meaning. Marital status has two levels, married and single. R codes it as an **indicator** (or dummy) variable taking the value 0 for the reference level, married, and 1 for single:
+
+$$
+x_i = \begin{cases} 0 & \text{if participant } i \text{ is married} \\ 1 & \text{if participant } i \text{ is single} \end{cases}
+$$
+
+Substituting each value into the regression function shows what the two coefficients now represent:
+
+$$
+E\{\text{FBS} \mid \text{married}\} = \beta_0 + \beta_1 \times 0 = \beta_0
+$$
+$$
+E\{\text{FBS} \mid \text{single}\} = \beta_0 + \beta_1 \times 1 = \beta_0 + \beta_1
+$$
+
+::: {.callout-tip}
+## Interpreting an indicator variable
+
+With a two-level categorical predictor, the **intercept is the mean outcome in the reference group**, and the **slope is the difference in mean outcome between the two groups**. Simple linear regression with a binary predictor is algebraically identical to a two-sample $t$-test assuming equal variances.
+:::
+
+```{r}
+#| label: tbl-mar
+#| tbl-cap: "Simple linear regression of fasting blood sugar (mmol/L) on marital status, with married as the reference category."
+
+tbl_regression(m_mar, label = list(marital = "Marital status"), intercept = TRUE) |>
+  add_glance_table(include = c(r.squared, sigma, nobs)) |>
+  as_gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+```{r}
+#| label: fig-mar
+#| fig-cap: "Distribution of fasting blood sugar by marital status. Box plots show the median and interquartile range; red points and intervals show the group means with 95% confidence intervals, which are the quantities the regression model estimates. The difference in means is real but small against the spread within each group."
+
+ggplot(mssm |> filter(!is.na(marital)), aes(marital, fasting_blood_sugar)) +
+  geom_boxplot(width = 0.4, outlier.alpha = 0.15, outlier.size = 0.6) +
+  stat_summary(fun.data = mean_cl_normal, colour = "#C0392B", size = 0.6) +
+  coord_cartesian(ylim = c(0, 20)) +
+  labs(x = "Marital status", y = "Fasting blood sugar (mmol/L)")
+```
+
+```{r}
+#| label: mar-means
+mar_means <- mssm |>
+  filter(!is.na(marital)) |>
+  group_by(marital) |>
+  summarise(mean = mean(fasting_blood_sugar), n = n(), .groups = "drop")
+```
+
+The fitted equation is $\widehat{\text{FBS}} = `r fmt(coef(m_mar)[1], 3)` `r ifelse(coef(m_mar)[2] < 0, "-", "+")` `r fmt(abs(coef(m_mar)[2]), 3)` \times \text{single}$, and the coefficients recover the group means exactly:
+
+- Mean FBS in **married** participants is the intercept, `r fmt(coef(m_mar)[1], 3)` mmol/L, which equals the directly computed married mean of `r fmt(mar_means$mean[mar_means$marital == "Married"], 3)` mmol/L.
+- Mean FBS in **single** participants is $`r fmt(coef(m_mar)[1], 3)` `r ifelse(coef(m_mar)[2] < 0, "-", "+")` `r fmt(abs(coef(m_mar)[2]), 3)` = `r fmt(sum(coef(m_mar)), 3)`$ mmol/L, matching the directly computed single mean of `r fmt(mar_means$mean[mar_means$marital == "Single"], 3)` mmol/L.
+- The **coefficient** of `r fmt(coef(m_mar)[2], 3)` mmol/L is therefore the mean difference, single minus married.
+
+The 95% confidence interval for that difference is `r ci(m_mar, "maritalSingle", 3)` mmol/L and the $p$-value is `r fmt_p(summary(m_mar)$coefficients["maritalSingle", 4])`. The interval excludes zero, so there **is** evidence that mean fasting blood sugar differs by marital status: single participants average about `r fmt(abs(coef(m_mar)[2]), 2)` mmol/L lower than married participants.
+
+This model is worth dwelling on, because it is the cleanest example in the dataset of a result that is statistically convincing and substantively slight. The $p$-value of `r fmt_p(summary(m_mar)$coefficients["maritalSingle", 4])` looks impressive; the $R^2$ of `r fmt(100 * summary(m_mar)$r.squared, 2)`% reveals that marital status accounts for about one part in `r fmt(round(1 / summary(m_mar)$r.squared), 0)` of the variation in FBS. A difference of `r fmt(abs(coef(m_mar)[2]), 2)` mmol/L is also small against a within-group standard deviation of roughly `r fmt(sigma(m_mar), 1)` mmol/L, as @fig-mar shows: the two distributions overlap almost completely.
+
+::: {.callout-warning}
+## A significant coefficient is not an important one
+
+Marital status is significantly associated with fasting blood sugar ($p$ = `r fmt(summary(m_mar)$coefficients["maritalSingle", 4], 4)`) and explains `r fmt(100 * summary(m_mar)$r.squared, 2)`% of its variation. Both statements are true, and only the second one is informative about magnitude.
+
+Note also that marital status is almost certainly a proxy here rather than a cause. Married participants in this sample are likely to be older, and age is itself associated with FBS. Whether the association survives adjustment for age is a question this simple model cannot answer — which is the motivation for @sec-mlr.
+:::
+
+Not every covariate produces even this much. Residence and sex, as @tbl-slr-all shows, give $p$-values of `r fmt_p(slr_tab$p[slr_tab$variable == "Residence"])` and `r fmt_p(slr_tab$p[slr_tab$variable == "Sex"])` respectively — no evidence of any difference in mean FBS. Such results should be reported as they stand. They do not demonstrate that the groups are identical; they show that any difference is too small to distinguish from zero at this sample size, with the confidence interval bounding how large it could plausibly be. Nor does a non-significant unadjusted result mean a variable is irrelevant to the analysis: residence is retained in the multivariable model of @sec-mlr, where its adjusted coefficient behaves differently from its crude one.
+
+Both models are now fitted and interpreted. Neither has yet been checked. Coefficient tables of the kind shown above are the same whether the model's assumptions hold or fail completely, which is why the next section examines the residuals before any of these conclusions is allowed to stand.
+
+# Assessment of the Simple Linear Regression Model {#sec-slr-assessment}
+
+The two models fitted in @sec-slr-application produced coefficient tables, confidence intervals and $p$-values. Those quantities are all computed under the LINE conditions. If the conditions fail, the arithmetic still runs and the table still prints, but the inference it supports may be wrong. Nothing in a coefficient table reveals whether this has happened.
+
+Model assessment closes that gap. The strategy is indirect: the errors $\epsilon_i$ are unobservable, so their observable counterparts, the residuals, are examined instead. This section develops that examination and applies it to both worked examples.
+
+## Residuals {#sec-residuals}
+
+::: {.callout-note}
+## Definition: residual
+
+The **residual** for observation $i$ is the difference between the observed and the fitted outcome:
+
+$$
+e_i = y_i - \hat{y}_i
+$$
+
+It is the observable counterpart of the unobservable **error**, $\epsilon_i = Y_i - E\{Y_i\}$, which is the deviation of the observation from the *population* regression line.
+:::
+
+The distinction matters. The error measures distance from the true population line, which is never known. The residual measures distance from the fitted sample line, which is known. Residual analysis proceeds on the reasoning that if the model's conditions hold, the residuals should behave approximately as a sample of independent, normally distributed values with constant variance and mean zero.
+
+Two properties of least squares residuals follow from the estimation itself and are not evidence of anything: they sum to zero, and they are uncorrelated with the predictor. Diagnostic information lies in their *pattern*, not their sum.
+
+Because residuals are measured in the units of the outcome, judging whether one is "large" requires a scale. Dividing a residual by its estimated standard deviation gives a **standardised residual**, a unitless quantity expressing how many standard deviations an observation lies from the fitted line. This makes a rough flag available: standardised residuals beyond $\pm 2$ merit a look. That threshold should be used with care, since in well-behaved data roughly 5% of observations exceed it by chance alone; flagging only values beyond $\pm 3$, where about 0.2% would be expected, is often more practical. In either case a flagged observation is **marked for investigation, not for deletion**.
+
+## Residuals versus fitted values {#sec-resid-fit}
+
+The residuals-versus-fitted-values plot is the most frequently produced diagnostic in regression. Residuals are plotted on the vertical axis against fitted values on the horizontal axis. Because any observation lying exactly on the regression line has a residual of zero, the horizontal line at zero in this plot *is* the fitted regression line, viewed edge-on.
+
+::: {.callout-tip}
+## Reading a residuals versus fitted values plot
+
+A well-behaved plot has three features:
+
+1. Residuals **bounce randomly** about the zero line — supporting **linearity**.
+2. Residuals form a **roughly horizontal band** of constant width — supporting **equal variances**.
+3. **No residual stands out** conspicuously from the rest — suggesting no outliers.
+:::
+
+@fig-bmi-resid shows this plot for the regression of FBS on body mass index.
+
+```{r}
+#| label: fig-bmi-resid
+#| fig-cap: "Residuals versus fitted values for the regression of fasting blood sugar on body mass index. The red curve is a loess smoother. Two departures from the ideal are visible: the residuals are not a horizontal band of constant width but widen as the fitted values increase, and they are strongly asymmetric about zero, extending much further above the line than below it."
+
+p_resid_fit(m_bmi, title = NULL)
+```
+
+The plot fails two of the three criteria. The vertical spread of residuals is far from constant: it is narrow at low fitted values and widens substantially as fitted values increase. And the residuals are strongly asymmetric, reaching almost `r fmt(max(residuals(m_bmi)), 0)` mmol/L above the line but only about `r fmt(abs(min(residuals(m_bmi))), 1)` mmol/L below it.
+
+Both features are consequences of the outcome's skew, noted in @sec-data. Fasting blood sugar has a floor near zero but no practical ceiling, so participants with impaired glucose regulation generate large positive residuals with no negative counterparts. The equal-variance condition is not satisfied, and the normality condition is unlikely to be either.
+
+A caution about reading such plots is warranted. Interpretation is subjective, and the temptation to see structure in randomness is strong — particularly in small datasets. The practical rule is that genuine problems announce themselves clearly; if a plot looks broadly acceptable, it usually is. The pattern in @fig-bmi-resid is not a subtle one.
+
+## Residuals versus the predictor {#sec-resid-pred}
+
+Residuals can also be plotted against a predictor. The criteria for reading the plot are exactly those of @sec-resid-fit, but its purpose depends on which predictor is chosen.
+
+If the predictor is **already in the model**, the plot adds nothing in simple linear regression. Fitted values are a linear function of the single predictor, so this plot is a rescaled version of @fig-bmi-resid, horizontally stretched or reflected.
+
+If the predictor is **not in the model**, the plot becomes genuinely informative, and this is where its value lies. Residuals may be regarded as a "new response" — the outcome after removing what the current model explains. Plotting this new response against a candidate predictor asks whether that variable explains any of the variation left over. A systematic trend indicates that it does and should be considered for inclusion; no trend indicates it need not be.
+
+```{r}
+#| label: fig-bmi-resid-others
+#| fig-cap: "Residuals from the regression of fasting blood sugar on body mass index, plotted against two predictors omitted from that model. Both show a clear upward trend, indicating that age and fasting triglyceride explain variation in fasting blood sugar that body mass index alone leaves unexplained. This is direct diagnostic evidence for moving to a multivariable model."
+#| fig-height: 3.6
+
+p_resid_vs(m_bmi, "age", "Age (years)", "Residuals vs age") +
+  p_resid_vs(m_bmi, "fasting_tg", "Fasting triglyceride (mmol/L)",
+             "Residuals vs triglyceride")
+```
+
+@fig-bmi-resid-others makes the case for multiple regression on diagnostic grounds rather than by assertion. Both omitted predictors show clear upward trends against the residuals, so both explain variation that body mass index alone does not. This observation motivates @sec-mlr directly.
+
+## Identifying specific problems from residual plots {#sec-resid-problems}
+
+Different violations leave different signatures. @tbl-resid-patterns summarises the mapping.
+
+::: {#tbl-resid-patterns}
+| Pattern in the residual plot | Condition threatened | Typical remedy |
+|:--------------|:---------|:------------|
+| Residuals depart from zero **systematically** — for example positive at low $x$, negative at mid $x$, positive again at high $x$ | **Linearity**: the regression function is not linear | Transform the predictor; add a polynomial term; consider a more flexible model |
+| **Fanning** — residuals tight at low fitted values, increasingly spread at high fitted values | **Equal variance** | Transform the outcome; use heteroscedasticity-consistent standard errors; use weighted least squares |
+| **Funnelling** — residuals widely spread at low fitted values, tight at high fitted values | **Equal variance** | As above |
+| A residual **stands apart** from the random pattern of the rest | An **outlier** is present, or the model is misspecified for that observation | Investigate the observation; check for measurement or data-entry error; assess its influence |
+| Residuals show a **trend against a predictor not in the model** | An important predictor has been **omitted** | Add that predictor, or an appropriate transformation of it |
+| Residuals show a **systematic pattern against time or spatial order** | **Independence** | Use a model for correlated data, such as a time-series model |
+
+Mapping of residual plot patterns to the model condition they threaten.
+:::
+
+Two warnings apply to this table. First, a high $R^2$ provides no protection against any of these problems: a model can explain the great majority of the variance in the outcome and still display unmistakable curvature in its residuals. Second, more than one problem can occur simultaneously, and frequently does. In @fig-bmi-resid the same plot shows both non-constant variance and marked asymmetry.
+
+## The normal probability plot of residuals {#sec-npp}
+
+Equal variance and linearity are assessed from residual plots. Normality requires a different display: the **normal probability plot**, also called the quantile–quantile or QQ plot.
+
+Its construction is a direct comparison of observed and expected quantiles. The residuals are ordered from smallest to largest. For each, the value that would be expected at that position in a sample of the same size from a normal distribution is computed. Observed values are plotted against expected values. Since the mean and variance of the errors are unknown, standardised residuals are used and the expected quantiles become standard normal scores. **If the residuals are normally distributed, the points fall approximately on a straight line.**
+
+Four patterns recur, and recognising them is the point of the plot:
+
+| Pattern in the normal probability plot | Interpretation |
+|:-----------------|:-------------------|
+| Points approximately on a straight line | Normality is reasonable |
+| Straight except for one or two deviating points | Normality is reasonable apart from outliers, which should be investigated |
+| A smooth curve, bending away from the line | The residual distribution is **skewed** |
+| Straight in the middle, departing at both ends | The residual distribution is **heavy-tailed** |
+
+```{r}
+#| label: fig-bmi-qq
+#| fig-cap: "Normal probability plot of standardised residuals from the regression of fasting blood sugar on body mass index, with a histogram of the same residuals for comparison. The points track the reference line through the centre of the distribution but curve sharply upward in the upper tail, the classic signature of right skew. The histogram shows the same feature directly."
+#| fig-height: 3.6
+
+p_qq(m_bmi, title = "Normal probability plot") +
+  (tibble(r = residuals(m_bmi)) |>
+     ggplot(aes(r)) +
+     geom_histogram(bins = 60, fill = "grey45") +
+     labs(x = "Residual (mmol/L)", y = "Count", title = "Histogram of residuals"))
+```
+
+@fig-bmi-qq shows the third pattern unambiguously. The points follow the reference line through the central portion of the distribution and then curve steeply above it in the upper tail. The accompanying histogram confirms a long right tail. The residual distribution is skewed, not normal, with a skewness coefficient of `r fmt(mean(scale(residuals(m_bmi))^3), 2)` — a symmetric distribution would give approximately zero.
+
+How much this matters depends on what is being estimated, following the sensitivity ordering set out in @sec-slr. Inference about the slope is comparatively robust to non-normality, and at `r fmt(nobs(m_bmi), 0)` observations the central limit theorem protects the confidence interval for $b_1$ substantially. Prediction intervals for individual participants receive no such protection and would be unreliable here. The failure of equal variance seen in @fig-bmi-resid is the more serious of the two problems, because interval estimates and $p$-values are moderately sensitive to it.
+
+## Further residual plot examples {#sec-resid-further}
+
+Diagnostic plots look different when the predictor is categorical, and the second worked example illustrates this.
+
+```{r}
+#| label: fig-mar-resid
+#| fig-cap: "Diagnostic plots for the regression of fasting blood sugar on marital status. Because the predictor has only two levels, the model produces only two distinct fitted values, so the residuals fall into two vertical stripes of comparable length. The normal probability plot shows the same right skew as the previous model."
+#| fig-height: 3.6
+
+p_resid_fit(m_mar, title = "Residuals vs fitted values") +
+  p_qq(m_mar, title = "Normal probability plot")
+```
+
+The left panel of @fig-mar-resid contains only two vertical stripes of points. This is not a defect: a two-level predictor generates exactly two fitted values, the two group means. The interpretive rules must be adapted accordingly. Curvature cannot be assessed at all, since two points always determine a straight line and the linearity condition is automatically satisfied for a binary predictor. What *can* be assessed is whether the two stripes have comparable vertical spread, which is the equal-variance condition in the form it takes here — the assumption of a two-sample $t$-test.
+
+Here the two stripes are of similar length, and a formal test finds **no** evidence against constant variance ($p$ = `r fmt_p(bptest(m_mar)$p.value)`). This is an instructive contrast with @fig-bmi-resid. The equal-variance condition can hold comfortably in one model and fail badly in another fitted to the same outcome, because what the condition concerns is whether residual spread changes *across the fitted values* — and a two-level predictor produces only two of them. Passing this check is therefore much less reassuring for a binary predictor than it would be for a continuous one. The normal probability plot in the right panel still shows pronounced right skew, which is expected: the skew belongs to the outcome, and changing the predictor does not remove it.
+
+For completeness, the patterns to expect in other situations are worth naming, since they will not appear in this chapter's data. A **correctly specified model** produces residuals of constant spread with no discernible pattern. A **wrongly specified functional form** produces curvature, often *together* with increasing variance, as two simultaneous problems. **Heavy-tailed errors** produce a normal probability plot that is straight in the middle and departs at both ends. And where curvature and non-constant variance occur together, transforming the outcome — for instance to $\sqrt{y}$ — can sometimes resolve both at once, with predictions then squared back onto the original scale. That remedy is the subject of @sec-transformation.
+
+::: {.callout-important}
+## Where this leaves the two simple models
+
+Both models have markedly right-skewed residuals, and the body mass index model additionally has non-constant variance. The estimated slopes remain unbiased, and the substantive conclusions — a positive association with body mass index, a small negative difference for single participants — are unlikely to be artefacts. But for the body mass index model the standard errors, and therefore the confidence intervals and $p$-values, cannot be taken at face value.
+
+Two responses are available, and both are pursued below: bring in additional predictors so that less variation is left unexplained (@sec-mlr), and transform the variables so that the conditions are better satisfied (@sec-transformation).
+:::
+
+# Multiple Linear Regression {#sec-mlr}
+
+The diagnostic evidence of @sec-resid-pred showed that variables omitted from the simple model explain variation the model leaves behind. There is also a more fundamental reason to move beyond one predictor. In observational health research the association between an exposure and an outcome is almost never the association of interest on its own, because the people who differ in exposure differ in other ways as well. Multiple linear regression is the standard tool for separating these influences.
+
+## From one predictor to several
+
+Multiple linear regression extends simple linear regression to two or more predictors. The extension serves two distinct purposes, and confusing them is a frequent source of error.
+
+The first is **prediction**. More predictors generally mean more of the outcome's variation is explained and individual predictions become more accurate.
+
+The second, and in epidemiology far more important, is **adjustment**. Suppose interest lies in whether body mass index is associated with fasting blood sugar. Participants with a higher body mass index are on average older, have higher blood pressure and have higher triglyceride concentrations. The crude association of @sec-worked-numerical mixes all of these together. Multiple regression estimates the association attributable to body mass index *among participants who are alike in the other measured variables* — the **partial** or **adjusted** association.
+
+::: {.callout-tip}
+## The meaning, and the limits, of "holding other variables constant"
+
+An adjusted coefficient is routinely described as the effect of a predictor "holding the other predictors constant". The phrase is accurate about the arithmetic and misleading about the science. It describes a *statistical* comparison between participants with identical values of the other predictors in the model. It does **not** mean the variable has been experimentally manipulated, and it does not extend to variables that were never measured. Adjustment removes confounding by the covariates in the model, and by nothing else.
+:::
+
+## The multiple linear regression model {#sec-mlr-model}
+
+::: {.callout-note}
+## The multiple linear regression model
+
+With $k$ predictors,
+
+$$
+y_i = \beta_0 + \beta_1 x_{i1} + \beta_2 x_{i2} + \cdots + \beta_k x_{ik} + \epsilon_i,
+\qquad \epsilon_i \sim N(0, \sigma^2) \ \text{independently}
+$$
+
+where $\beta_0$ is the mean outcome when every predictor equals zero, and each $\beta_j$ is the change in the mean outcome per one-unit increase in $x_j$ **with all other predictors held constant**. The corresponding regression function is
+
+$$
+E\{Y_i\} = \beta_0 + \beta_1 x_{i1} + \cdots + \beta_k x_{ik}
+$$
+:::
+
+Three points about this model deserve emphasis.
+
+**"Linear" still refers to the parameters.** The predictors may include squares, logarithms or products of other predictors, and the model remains a linear model. This is what permits the transformations of @sec-transformation and the interaction terms of @sec-interaction to be handled without leaving the framework.
+
+**The geometry generalises.** With one predictor the fitted model is a line; with two it is a plane; with more than two it is a hyperplane that cannot be visualised but is described by exactly the same algebra.
+
+**The error variance estimate changes its divisor.** With $k$ predictors, $k+1$ parameters are estimated, so
+
+$$
+\hat{\sigma}^2 = \text{MSE} = \frac{SSE}{n - (k+1)}
+$$
+
+The sums-of-squares partition $SST = SSR + SSE$ carries over unchanged, and so does $R^2 = SSR/SST$, now called the **coefficient of multiple determination**. Because $R^2$ cannot decrease when a predictor is added, the **adjusted $R^2$** is used to compare models of different sizes:
+
+$$
+R^2_{adj} = 1 - \left( \frac{n-1}{n - (k+1)} \right) (1 - R^2)
+$$
+
+Unlike $R^2$, the adjusted version can fall when a predictor contributes less than its degree of freedom costs, which makes it the appropriate quantity for comparing competing models. It plays exactly that role in @sec-transformation.
+
+### Categorical predictors and indicator variables
+
+A categorical predictor with more than two levels cannot enter the model as a single number, because its codes carry no numerical meaning. It is represented instead by a set of **indicator** (dummy) variables: for a variable with $c$ levels, $c-1$ indicators are required, and the omitted level becomes the **reference** category.
+
+Ethnicity in the MSSM dataset has four levels, so three indicators are needed. Taking Malay as the reference:
+
+$$
+x_{\text{Chinese}} = \begin{cases} 1 & \text{if Chinese} \\ 0 & \text{otherwise} \end{cases}
+\quad
+x_{\text{Indian}} = \begin{cases} 1 & \text{if Indian} \\ 0 & \text{otherwise} \end{cases}
+\quad
+x_{\text{Other}} = \begin{cases} 1 & \text{if Other} \\ 0 & \text{otherwise} \end{cases}
+$$
+
+A Malay participant has all three indicators equal to zero, so the reference category is absorbed into the intercept. Each of the three coefficients is then the difference in mean outcome between that ethnic group and the Malay group, adjusted for the remaining covariates. **The choice of reference category changes the coefficients but changes nothing substantive** — no fitted value, no $R^2$, and no overall test result depends on it. It is chosen for interpretability, and the largest or most clinically natural group is the usual choice.
+
+## Fitting the multivariable model {#sec-mlr-fit}
+
+The model carried through the remainder of this chapter regresses fasting blood sugar on nine covariates: place of residence, ethnicity, age, **body mass index**, **waist–hip ratio**, systolic blood pressure, total cholesterol, fasting triglyceride, and history of diabetes.
+
+Adiposity is represented by the two derived indices of @sec-derived rather than by waist circumference. The reason is that waist circumference overlaps heavily with both — it is correlated `r fmt(cor(mssm$waist_cm, mssm$bmi), 2)` with body mass index and, being the numerator of the waist–hip ratio, `r fmt(cor(mssm$waist_cm, mssm$whr), 2)` with that. Entering all three would ask the model to separate three measurements of largely the same thing. @sec-multicollinearity fits exactly that model and shows what goes wrong. Using BMI and WHR together, by contrast, captures overall and central adiposity as two nearly independent dimensions.
+
+@tbl-mlr reports the result.
+
+```{r}
+#| label: tbl-mlr
+#| tbl-cap: "Multiple linear regression of fasting blood sugar (mmol/L) on nine covariates, including body mass index and waist-hip ratio. Each coefficient is the estimated difference in mean fasting blood sugar per one-unit increase in that covariate, adjusted for all others in the model."
+
+mlr_labels <- list(
+  ruralurban = "Residence", race = "Ethnicity", age = "Age (years)",
+  bmi = "Body mass index (kg/m²)", whr = "Waist-hip ratio",
+  sbp1 = "Systolic blood pressure (mmHg)",
+  total_cholesterol = "Total cholesterol (mmol/L)",
+  fasting_tg = "Fasting triglyceride (mmol/L)",
+  hx_dm2 = "History of diabetes")
+
+tbl_regression(m_mlr, label = mlr_labels) |>
+  add_glance_table(include = c(r.squared, adj.r.squared, sigma, nobs)) |>
+  as_gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+The model was fitted to `r fmt(n_mlr, 0)` participants with complete data on all ten variables, `r fmt(n_total - n_mlr, 0)` records having been excluded. It explains $R^2 = `r fmt(100 * summary(m_mlr)$r.squared, 1)`$% of the variation in fasting blood sugar, with an adjusted $R^2$ of `r fmt(100 * summary(m_mlr)$adj.r.squared, 1)`% — a substantial improvement on the `r fmt(100 * r2_bmi, 1)`% achieved by body mass index alone, and a direct vindication of the diagnostic signal in @fig-bmi-resid-others. The residual standard error has fallen from `r fmt(sigma(m_bmi), 2)` to `r fmt(sigma(m_mlr), 2)` mmol/L.
+
+The fitted regression equation, written out in full, is
+
+$$
+\begin{aligned}
+\widehat{\text{FBS}} = & `r fmt(coef(m_mlr)[1], 3)`
++ `r fmt(coef(m_mlr)["ruralurbanUrban"], 3)` \, (\text{urban})
+`r fmt(coef(m_mlr)["raceChinese"], 3)` \, (\text{Chinese}) \\
+& `r fmt(coef(m_mlr)["raceIndian"], 3)` \, (\text{Indian})
+`r fmt(coef(m_mlr)["raceOther"], 3)` \, (\text{Other})
++ `r fmt(coef(m_mlr)["age"], 4)` \, \text{age} \\
+& + `r fmt(coef(m_mlr)["bmi"], 4)` \, \text{BMI}
++ `r fmt(coef(m_mlr)["whr"], 4)` \, \text{WHR}
++ `r fmt(coef(m_mlr)["sbp1"], 4)` \, \text{SBP} \\
+& + `r fmt(coef(m_mlr)["total_cholesterol"], 3)` \, \text{cholesterol}
++ `r fmt(coef(m_mlr)["fasting_tg"], 3)` \, \text{triglyceride}
++ `r fmt(coef(m_mlr)["hx_dm2Yes"], 3)` \, (\text{diabetes history})
+\end{aligned}
+$$
+
+Three coefficients illustrate how such a model is read.
+
+**A continuous covariate.** The coefficient for fasting triglyceride is `r b(m_mlr, "fasting_tg", 3)` mmol/L (95% CI `r ci(m_mlr, "fasting_tg", 3)`, $p$ `r pv(m_mlr, "fasting_tg")`). Among participants of the same residence, ethnicity, age, body mass index, waist–hip ratio, systolic blood pressure, total cholesterol and diabetes history, a triglyceride concentration higher by 1 mmol/L is associated with a mean fasting blood sugar higher by `r b(m_mlr, "fasting_tg", 3)` mmol/L.
+
+**A derived covariate on an awkward scale.** The coefficient for waist–hip ratio is `r b(m_mlr, "whr", 3)` mmol/L (95% CI `r ci(m_mlr, "whr", 3)`, $p$ `r pv(m_mlr, "whr")`). Read literally this is the change in mean FBS for a one-unit increase in the ratio — but WHR spans only `r fmt(min(mssm$whr), 2)` to `r fmt(max(mssm$whr), 2)`, so a one-unit change is far larger than anything observed. A ratio is best rescaled before reporting: per 0.1 higher WHR, roughly the gap between the first and third quartiles of this sample, mean FBS differs by `r fmt(0.1 * coef(m_mlr)["whr"], 4)` mmol/L. **Whenever a coefficient's natural unit is much larger than the spread of the variable, rescale it before reporting.**
+
+**A categorical covariate.** The coefficient for history of diabetes is `r b(m_mlr, "hx_dm2Yes", 3)` mmol/L (95% CI `r ci(m_mlr, "hx_dm2Yes", 3)`). Adjusted for the other seven covariates, participants reporting a previous diagnosis of diabetes have a mean fasting blood sugar `r b(m_mlr, "hx_dm2Yes", 3)` mmol/L higher than those who do not. As noted in @sec-slr-application, this is a marker of established disease rather than a risk factor, and it is in the model to make the other coefficients interpretable rather than to be interpreted itself.
+
+## Crude and adjusted estimates compared {#sec-crude-adjusted}
+
+The purpose of adjustment is best seen by placing crude and adjusted estimates side by side, as in @tbl-crude-adj.
+
+```{r}
+#| label: tbl-crude-adj
+#| tbl-cap: "Crude (unadjusted) and adjusted regression coefficients for fasting blood sugar. Crude estimates come from separate simple linear regressions, one per covariate; adjusted estimates come from the single multivariable model of @tbl-mlr. Adjustment attenuates every association, and for age it removes it entirely."
+
+pretty_term <- c(
+  "ruralurbanUrban" = "Urban vs rural residence",
+  "raceChinese" = "Chinese vs Malay", "raceIndian" = "Indian vs Malay",
+  "raceOther" = "Other vs Malay", "age" = "Age (per year)",
+  "bmi" = "Body mass index (per kg/m²)",
+  "whr" = "Waist-hip ratio (per unit)",
+  "sbp1" = "Systolic BP (per mmHg)",
+  "total_cholesterol" = "Total cholesterol (per mmol/L)",
+  "fasting_tg" = "Fasting triglyceride (per mmol/L)",
+  "hx_dm2Yes" = "History of diabetes (yes vs no)"
+)
+
+crude_tab <- map_dfr(
+  c("ruralurban", "race", "age", "bmi", "whr", "sbp1",
+    "total_cholesterol", "fasting_tg", "hx_dm2"),
+  \(v) tidy(lm(reformulate(v, response = "fasting_blood_sugar"), data = mssm)) |>
+    filter(term != "(Intercept)") |>
+    transmute(term, crude = estimate, crude_p = p.value)
+)
+
+adj_tab <- tidy(m_mlr) |>
+  filter(term != "(Intercept)") |>
+  transmute(term, adj = estimate, adj_p = p.value)
+
+left_join(crude_tab, adj_tab, by = "term") |>
+  mutate(
+    Covariate = pretty_term[term],
+    `Crude b` = fmt(crude, 4),
+    `Crude p` = if_else(crude_p < 0.001, "< 0.001", fmt(crude_p, 3)),
+    `Adjusted b` = fmt(adj, 4),
+    `Adjusted p` = if_else(adj_p < 0.001, "< 0.001", fmt(adj_p, 3)),
+    `Change` = paste0(fmt(100 * (adj - crude) / crude, 0), "%")
+  ) |>
+  select(Covariate, `Crude b`, `Crude p`, `Adjusted b`, `Adjusted p`, Change) |>
+  gt() |>
+  tab_options(table.font.size = pct(88)) |>
+  tab_footnote("Change is the percentage change in the coefficient from crude to adjusted.",
+               locations = cells_column_labels(columns = Change))
+```
+
+Every association is attenuated by adjustment, which is the expected consequence of covariates that are correlated with one another and with the outcome. The attenuation is severe for the adiposity measures: body mass index falls from `r fmt(crude_tab$crude[crude_tab$term == "bmi"], 4)` to `r b(m_mlr, "bmi", 4)` mmol/L per kg/m², and waist–hip ratio from `r fmt(crude_tab$crude[crude_tab$term == "whr"], 3)` to `r b(m_mlr, "whr", 3)`, the latter losing statistical significance entirely ($p$ `r pv(m_mlr, "whr")`). Most of what the crude adiposity associations captured is shared with triglyceride, blood pressure and diabetes status — which is precisely what one would expect of the metabolic syndrome this study was designed to examine.
+
+One result, however, is qualitatively different and is the most instructive finding in this chapter.
+
+::: {.callout-important}
+## Adjustment can eliminate an association entirely
+
+Considered alone, age is strongly associated with fasting blood sugar: `r fmt(crude_tab$crude[crude_tab$term == "age"], 4)` mmol/L per year of age, with $p$ = `r fmt_psci(crude_tab$crude_p[crude_tab$term == "age"])`. It appeared in @tbl-slr-all as one of the more convincing covariates.
+
+Adjusted for the other seven covariates, the age coefficient falls to `r b(m_mlr, "age", 4)` mmol/L per year with a 95% confidence interval of `r ci(m_mlr, "age", 4)` and $p$ = `r fmt_p(summary(m_mlr)$coefficients["age", 4])`. **The association has disappeared.**
+:::
+
+The explanation is not that age is unimportant, but that its crude association operates through the other measured variables. Older participants in this sample have a higher body mass index, higher systolic blood pressure and a much higher prevalence of diagnosed diabetes. Once participants are compared *within* strata of those variables, age itself adds essentially nothing.
+
+Whether that is the right analysis depends entirely on the research question, and this is a subject-matter judgement rather than a statistical one:
+
+- If the question is **how much fasting blood sugar differs between older and younger people in this population**, the crude estimate answers it, and adjusting away the pathways through which age acts would be a mistake.
+- If the question is **whether age has an influence on glycaemia beyond its effects on adiposity, blood pressure and diabetes status**, the adjusted estimate answers it, and the answer is that it does not detectably.
+
+The distinction is the classical one between confounders and mediators. A **confounder** is a common cause of exposure and outcome, and adjusting for it removes bias. A **mediator** lies on the causal pathway from exposure to outcome, and adjusting for it removes part of the very effect being estimated. The two are statistically indistinguishable — both change the coefficient when added to a model — and can be separated only by reasoning about the subject matter and the temporal ordering of the variables. Body mass index and diabetes status are far more plausibly consequences of ageing than causes of it, which suggests that here the adjusted age coefficient has removed mediated effects rather than confounding.
+
+## Testing several parameters at once: the general linear F-test {#sec-f-test}
+
+@tbl-mlr reports a $t$-test for each coefficient, each of which asks whether a *single* parameter is zero. Some questions cannot be phrased that way. Ethnicity occupies three coefficients, and "does ethnicity matter?" is a question about all three simultaneously. Testing them one at a time is both indirect and statistically wasteful, since performing several tests inflates the chance of a spurious result.
+
+The **general linear F-test** answers such questions with a single test. Its logic is a comparison of two nested models:
+
+1. Specify a **full model** containing all the parameters of interest.
+2. Specify a **reduced model** obtained by imposing the constraint stated in the null hypothesis — here, that all three ethnicity coefficients are zero.
+3. Compare the two models' error sums of squares.
+
+::: {.callout-note}
+## The general linear F-test
+
+$$
+F^* = \frac{\left( SSE(R) - SSE(F) \right) / \left( df_R - df_F \right)}{SSE(F) / df_F}
+$$
+
+where $SSE(R)$ and $SSE(F)$ are the error sums of squares of the reduced and full models, and $df_R$ and $df_F$ are their error degrees of freedom. The null hypothesis always corresponds to the **reduced** model and the alternative to the **full** model. A large $F^*$, and correspondingly small $p$-value, rejects the reduced model in favour of the full one.
+:::
+
+Because the reduced model is constrained, it can never fit better than the full model, so $SSE(R) \ge SSE(F)$ always. The test asks whether the improvement in fit is larger than the extra parameters would be expected to deliver by chance alone.
+
+### Application: does ethnicity contribute to the model?
+
+The hypotheses are
+
+$$
+H_0: \beta_{\text{Chinese}} = \beta_{\text{Indian}} = \beta_{\text{Other}} = 0
+\qquad \text{versus} \qquad
+H_A: \text{at least one is non-zero}
+$$
+
+```{r}
+#| label: f-test
+anova_race <- anova(m_no_race, m_mlr)
+sse_r <- anova_race$RSS[1]; sse_f <- anova_race$RSS[2]
+df_r  <- anova_race$Res.Df[1]; df_f <- anova_race$Res.Df[2]
+f_race <- anova_race$F[2]
+```
+
+Fitting both models to the same `r fmt(n_mlr, 0)` participants gives $SSE(R) = `r fmt(sse_r, 1)`$ with $df_R = `r fmt(df_r, 0)`$, and $SSE(F) = `r fmt(sse_f, 1)`$ with $df_F = `r fmt(df_f, 0)`$. Substituting into the formula:
+
+$$
+F^* = \frac{(`r fmt(sse_r, 1)` - `r fmt(sse_f, 1)`) / (`r fmt(df_r, 0)` - `r fmt(df_f, 0)`)}
+{`r fmt(sse_f, 1)` / `r fmt(df_f, 0)`}
+= \frac{`r fmt((sse_r - sse_f) / (df_r - df_f), 1)`}{`r fmt(sse_f / df_f, 4)`}
+= `r fmt(f_race, 2)`
+$$
+
+With `r fmt(df_r - df_f, 0)` and `r fmt(df_f, 0)` degrees of freedom this gives $p$ `r fmt_p(anova_race[["Pr(>F)"]][2])`. The reduced model is rejected: **ethnicity contributes to the explanation of fasting blood sugar after adjustment for the other seven covariates.**
+
+This conclusion could not have been drawn safely from @tbl-mlr, where the Indian-versus-Malay contrast is not significant ($p$ = `r fmt_p(summary(m_mlr)$coefficients["raceIndian", 4])`) while the other two are. Individual contrasts answer questions about specific group comparisons; the F-test answers the question about the variable as a whole. The F-test is also invariant to the choice of reference category, whereas the individual $t$-tests are not — another reason to prefer it for this purpose.
+
+Two special cases of the same test are worth recognising. When the reduced model contains only the intercept, the general linear F-test becomes the **overall F-test** reported with every regression output, testing whether all slopes are simultaneously zero; here it gives $F$ = `r fmt(summary(m_mlr)$fstatistic[1], 1)` on `r fmt(summary(m_mlr)$fstatistic[2], 0)` and `r fmt(summary(m_mlr)$fstatistic[3], 0)` degrees of freedom, $p$ < 0.001. When the reduced model omits exactly one parameter, the F-test is algebraically equivalent to the $t$-test for that coefficient, since $t^2 = F$ on one numerator degree of freedom. The general form is needed only for testing a *subset* of two or more parameters.
+
+## Multicollinearity {#sec-multicollinearity}
+
+Adjustment relies on being able to separate the contributions of correlated predictors. When predictors are *highly* correlated with one another, that separation becomes unstable — a condition called **multicollinearity**. Its symptoms are inflated standard errors, coefficients that change substantially when a covariate is added or removed, and occasionally coefficients with implausible signs.
+
+The **variance inflation factor** (VIF) quantifies it: $\text{VIF}_j = 1/(1 - R_j^2)$, where $R_j^2$ comes from regressing predictor $j$ on all the others. A VIF of 1 indicates no correlation with the other predictors; values above 5 are commonly regarded as cause for concern and values above 10 as serious. For multi-category variables the generalised VIF is reported, and is compared after taking the root indicated by its degrees of freedom.
+
+```{r}
+#| label: tbl-vif
+#| tbl-cap: "Generalised variance inflation factors for the multivariable model of @tbl-mlr. All values are close to 1, so multicollinearity is not a concern in this model."
+
+vif_names <- c(
+  ruralurban = "Residence", race = "Ethnicity", age = "Age",
+  bmi = "Body mass index", whr = "Waist-hip ratio",
+  waist_cm = "Waist circumference", sbp1 = "Systolic blood pressure",
+  total_cholesterol = "Total cholesterol", fasting_tg = "Fasting triglyceride",
+  hx_dm2 = "History of diabetes"
+)
+
+vif_table <- function(model) {
+  vm <- vif(model)
+  tibble(
+    Covariate = unname(vif_names[rownames(vm)]),
+    GVIF      = fmt(vm[, "GVIF"], 2),
+    Df        = as.integer(vm[, "Df"]),
+    adj       = fmt(vm[, "GVIF^(1/(2*Df))"], 2)
+  ) |>
+    gt() |>
+    cols_label(adj = "GVIF^(1/(2·Df))") |>
+    tab_options(table.font.size = pct(88))
+}
+
+vif_table(m_mlr)
+```
+
+@tbl-vif is reassuring: every value is close to 1, the largest being `r fmt(max(vif(m_mlr)[, 1]), 2)`. The nine covariates carry largely distinct information, and the adjusted coefficients can be interpreted without concern on this count. Body mass index and waist–hip ratio coexist comfortably because, as @sec-derived showed, they measure different things and are correlated only `r fmt(cor(mssm$bmi, mssm$whr), 2)`.
+
+### What multicollinearity looks like when it is present {#sec-collinearity-demo}
+
+This model was constructed to avoid the problem, and a reader could be forgiven for concluding that multicollinearity is a theoretical worry. It is not. The dataset makes it easy to demonstrate: simply add waist circumference back alongside body mass index and waist–hip ratio, so that three overlapping measures of adiposity compete to explain the same variation.
+
+```{r}
+#| label: tbl-vif-collinear
+#| tbl-cap: "Generalised variance inflation factors after adding waist circumference to the model, so that three overlapping measures of adiposity are included together. Compare with @tbl-vif: the three adiposity terms are now badly inflated while every other covariate is unaffected."
+
+vif_table(m_mlr_waist)
+```
+
+```{r}
+#| label: tbl-collinear-coefs
+#| tbl-cap: "The three adiposity coefficients estimated without and with waist circumference in the model. Adding a third overlapping measure roughly doubles the standard errors and renders all three terms non-significant, even though the model's explanatory power is unchanged."
+
+adip <- function(model, terms) {
+  tidy(model) |> filter(term %in% terms) |>
+    transmute(term, est = estimate, se = std.error, p = p.value)
+}
+a1 <- adip(m_mlr, c("bmi", "whr"))
+a2 <- adip(m_mlr_waist, c("bmi", "whr", "waist_cm"))
+
+tibble(
+  Term = c("Body mass index", "Waist-hip ratio", "Waist circumference"),
+  `b (without waist)` = c(fmt(a1$est[a1$term == "bmi"], 4),
+                          fmt(a1$est[a1$term == "whr"], 4), "—"),
+  `SE (without waist)` = c(fmt(a1$se[a1$term == "bmi"], 4),
+                           fmt(a1$se[a1$term == "whr"], 4), "—"),
+  `p (without)` = c(fmt(a1$p[a1$term == "bmi"], 3),
+                    fmt(a1$p[a1$term == "whr"], 3), "—"),
+  `b (with waist)` = fmt(a2$est[match(c("bmi","whr","waist_cm"), a2$term)], 4),
+  `SE (with waist)` = fmt(a2$se[match(c("bmi","whr","waist_cm"), a2$term)], 4),
+  `p (with)` = fmt(a2$p[match(c("bmi","whr","waist_cm"), a2$term)], 3)
+) |>
+  gt() |>
+  tab_options(table.font.size = pct(85))
+```
+
+```{r}
+#| label: collinear-numbers
+vif_waist <- vif(m_mlr_waist)[, 1]
+se_ratio_bmi <- summary(m_mlr_waist)$coefficients["bmi", "Std. Error"] /
+                summary(m_mlr)$coefficients["bmi", "Std. Error"]
+anova_waist <- anova(m_mlr, m_mlr_waist)
+```
+
+The consequences are textbook, and every one of them is visible above.
+
+**The variance inflation factors rise sharply, but only for the affected terms.** Waist circumference reaches `r fmt(vif_waist["waist_cm"], 1)`, body mass index `r fmt(vif_waist["bmi"], 1)` and waist–hip ratio `r fmt(vif_waist["whr"], 1)`, all beyond the conventional threshold of 5. Meanwhile residence, ethnicity, age, blood pressure, cholesterol, triglyceride and diabetes history are essentially unchanged from @tbl-vif. **Multicollinearity is a local problem**: it damages the estimates of the variables involved and leaves the rest of the model alone.
+
+**The standard errors inflate.** The standard error of the body mass index coefficient increases by a factor of `r fmt(se_ratio_bmi, 2)` — the "variance inflation" the statistic is named for. This is the mechanism by which collinearity does its damage.
+
+**Significance evaporates.** In @tbl-mlr body mass index was significant at $p$ `r pv(m_mlr, "bmi")`. With waist circumference added, all three adiposity terms become non-significant ($p$ = `r fmt(summary(m_mlr_waist)$coefficients["bmi", 4], 2)`, `r fmt(summary(m_mlr_waist)$coefficients["whr", 4], 2)` and `r fmt(summary(m_mlr_waist)$coefficients["waist_cm", 4], 2)`). A naive reading would conclude that adiposity is unrelated to fasting blood sugar, which is plainly false — the three measures are simply unable to be told apart.
+
+**Yet the model as a whole fits no better.** The general linear F-test for adding waist circumference gives $F$ = `r fmt(anova_waist$F[2], 2)` on 1 and `r fmt(anova_waist$Res.Df[2], 0)` degrees of freedom, $p$ = `r fmt(anova_waist[["Pr(>F)"]][2], 2)`, and the adjusted $R^2$ actually falls slightly, from `r fmt(100 * summary(m_mlr)$adj.r.squared, 3)`% to `r fmt(100 * summary(m_mlr_waist)$adj.r.squared, 3)`%. Waist circumference contributes nothing that BMI and WHR have not already contributed; it merely makes the existing coefficients harder to estimate.
+
+::: {.callout-warning}
+## Recognising and handling multicollinearity
+
+The signature is a combination that should always prompt suspicion: **a model that fits well overall while few or none of its individual predictors are significant**, often accompanied by coefficients that change substantially — sometimes reversing sign — when a covariate is added or removed.
+
+Detection: inspect pairwise correlations among predictors before fitting, and compute the VIF afterwards. Values above 5 warrant attention, above 10 are serious. As a rule of thumb, avoid entering predictors correlated above about 0.7 into the same model; here waist circumference correlates `r fmt(cor(mssm$waist_cm, mssm$bmi), 2)` with BMI.
+
+Remedies, in the order usually worth trying: **choose one measure from each correlated group** on subject-matter grounds, which is what @tbl-mlr does; **combine** the correlated variables into a single index, which is what BMI and WHR already are; or **centre** the predictors, which helps specifically for the collinearity between a variable and its own square or product term (@sec-interaction).
+
+What multicollinearity does *not* do is bias the coefficients or damage the model's predictions. If prediction is the sole aim, it can be ignored. It matters when the goal is to interpret individual coefficients — which, in epidemiology, it usually is.
+:::
+
+The dataset offers other opportunities to create the same problem. Systolic and diastolic blood pressure are correlated `r fmt(cor(mssm$sbp1, mssm$dbp1), 2)`, and weight, hip circumference and neck circumference are all closely related to the adiposity measures already in the model. Entering several members of any of these groups together would reproduce the instability shown above.
+
+The model is now fitted, its coefficients interpreted, its ethnicity block tested and its predictors checked for redundancy. What has not been examined is whether the conditions underlying all of these inferences are satisfied.
+
+# Assessment of Multiple Linear Regression {#sec-mlr-assessment}
+
+Every quantity in @tbl-mlr — each standard error, each confidence interval, each $p$-value, and the F-test of @sec-f-test — was computed on the assumption that the model's conditions hold. This section states those conditions for the multivariable case, assesses them graphically, and then applies the formal tests for the two that are most often examined in practice.
+
+## The assumptions for multiple linear regression {#sec-mlr-assumptions}
+
+The LINE conditions of @sec-slr carry over directly. The only change is that "at each value of $x$" becomes "at each **set** of values of the predictors".
+
+::: {.callout-note}
+## The LINE conditions for multiple linear regression
+
+For each combination of predictor values $(x_{i1}, x_{i2}, \ldots, x_{ik})$:
+
+| | Condition | Statement |
+|:--|:--|:------|
+| **L** | **L**inear | The mean outcome is a linear function of the predictors |
+| **I** | **I**ndependent | The errors are independent of one another |
+| **N** | **N**ormal | The errors are normally distributed |
+| **E** | **E**qual variance | The errors have the same variance $\sigma^2$ |
+
+Equivalently, the errors are independent $N(0, \sigma^2)$ random variables. Two further conditions are implicit: the predictor values are treated as **fixed and measured without error**, and the model is **correctly specified**, containing the variables that matter in the form in which they matter.
+:::
+
+A word on each condition as it applies to the model of @sec-mlr-fit.
+
+**Linearity** is now a statement about each predictor's contribution, holding the others fixed. It could fail for one predictor while holding for the rest — for instance if fasting blood sugar rose with age up to a point and then levelled off. It is assessed one predictor at a time.
+
+**Independence** requires that no observation's error conveys information about another's. It typically fails by design rather than by accident, in three recognisable situations: repeated measurements taken on the same individual over time; naturally grouped data, such as pupils within schools or patients within clinics, where members of a group resemble one another; and data collected in a time or spatial sequence, where neighbouring observations are correlated. None of these applies to the MSSM data, where each record is a separate participant measured once, so the condition is satisfied here. Where it does not hold, the remedy is not a repair to the linear model but a different class of model — mixed-effects models for grouped data, time-series models for sequential data. Independence deserves this attention because, as noted in @sec-slr, inference is *very* sensitive to its failure, and no residual plot will reveal a violation that the study design has built in.
+
+**Normality** concerns the errors, not the outcome or the predictors. It is common to see the outcome's own distribution tested for normality before fitting a regression; this is not what the model requires. A markedly skewed outcome can still yield well-behaved residuals if the skew is explained by the predictors.
+
+**Equal variance**, or homoscedasticity, requires the scatter of errors to be the same everywhere. Its failure does not bias the coefficients, but it invalidates the standard errors and therefore everything computed from them.
+
+## Assessing the model assumptions {#sec-assessing}
+
+All the diagnostic tools of @sec-slr-assessment apply unchanged. @fig-mlr-diagnostics shows the standard set for the multivariable model.
+
+```{r}
+#| label: fig-mlr-diagnostics
+#| fig-cap: "Diagnostic plots for the multivariable model. Top left: residuals versus fitted values, showing a pronounced fan shape as fitted values increase. Top right: the normal probability plot, curving sharply upward in the right tail. Bottom left: the scale-location plot, whose rising smoother confirms that residual spread grows with the fitted value. Bottom right: histogram of residuals, showing the long right tail directly."
+#| fig-width: 9
+#| fig-height: 7
+
+(p_resid_fit(m_mlr, "Residuals vs fitted values") | p_qq(m_mlr, "Normal probability plot")) /
+(p_scale_loc(m_mlr, "Scale-location") |
+   (tibble(r = residuals(m_mlr)) |>
+      ggplot(aes(r)) +
+      geom_histogram(bins = 60, fill = "grey45") +
+      labs(x = "Residual (mmol/L)", y = "Count", title = "Histogram of residuals")))
+```
+
+The four panels tell a consistent story, and it is the same story as in @sec-slr-assessment.
+
+The **residuals-versus-fitted plot** shows a clear fan: residual spread is narrow where fitted values are low and much wider where they are high. Equal variance fails. The **scale-location plot**, which plots the square root of the absolute standardised residual against the fitted value, makes the same point more directly — a horizontal smoother would indicate constant variance, and this one rises steadily. The **normal probability plot** follows the reference line through the centre and then departs sharply upward, the signature of right skew described in @sec-npp. The **histogram** confirms it: residual skewness is `r fmt(mean(scale(residuals(m_mlr))^3), 2)` and kurtosis is `r fmt(mean(scale(residuals(m_mlr))^4), 1)`, against values of 0 and 3 for a normal distribution.
+
+Linearity is assessed predictor by predictor, in @fig-mlr-resid-preds.
+
+```{r}
+#| label: fig-mlr-resid-preds
+#| fig-cap: "Residuals from the multivariable model plotted against each continuous predictor in the model. A horizontal smoother indicates that the predictor's linear specification is adequate. All six are close to horizontal across the bulk of the data, so the linearity condition is reasonably met for each; the wandering at the extremes of the triglyceride, cholesterol and waist-hip ratio panels reflects the sparse data there rather than systematic curvature."
+#| fig-width: 9
+#| fig-height: 5.5
+
+(p_resid_vs(m_mlr, "age", "Age (years)", "Age") |
+ p_resid_vs(m_mlr, "bmi", "Body mass index (kg/m²)", "Body mass index") |
+ p_resid_vs(m_mlr, "whr", "Waist-hip ratio", "Waist-hip ratio")) /
+(p_resid_vs(m_mlr, "sbp1", "Systolic BP (mmHg)", "Systolic BP") |
+ p_resid_vs(m_mlr, "total_cholesterol", "Total cholesterol (mmol/L)", "Cholesterol") |
+ p_resid_vs(m_mlr, "fasting_tg", "Fasting triglyceride (mmol/L)", "Triglyceride"))
+```
+
+These panels are more encouraging. Each smoother is close to horizontal across the region where most of the data lie, so **the linear specification of each predictor is adequate**; the problems in this model concern the error distribution, not the functional form. This distinction matters for @sec-transformation, because it determines which transformation is worth attempting.
+
+A final graphical check plots the residuals against predictors *omitted* from the model, asking whether an important variable has been left out.
+
+```{r}
+#| label: fig-mlr-omitted
+#| fig-cap: "Residuals from the multivariable model plotted against two measured variables omitted from it. Neither shows a strong trend, indicating that neither would add appreciably to the model — diastolic blood pressure because systolic pressure already carries that information, and waist circumference because body mass index and waist-hip ratio between them already do."
+#| fig-height: 3.6
+
+p_resid_vs(m_mlr, "dbp1", "Diastolic blood pressure (mmHg)", "Diastolic BP") +
+  p_resid_vs(m_mlr, "waist_cm", "Waist circumference (cm)", "Waist circumference")
+```
+
+Neither omitted variable shows a marked trend in @fig-mlr-omitted, so neither is an obviously missing predictor. This is expected, since each is closely related to variables already included. The waist circumference panel is the graphical counterpart of the formal test in @sec-collinearity-demo: the flat smoother says there is no leftover signal for waist circumference to explain, which is why adding it inflated the standard errors without improving the fit.
+
+### Outliers, leverage and influence
+
+Three related but distinct ideas arise when individual observations are examined.
+
+- An **outlier** has a large residual: its outcome is far from what the model predicts.
+- A **high-leverage** point has an unusual combination of *predictor* values, far from the centre of the predictor space. Leverage concerns the $x$ values only and can be computed before the outcome is even seen.
+- An **influential** point is one whose removal would materially change the fitted model. Influence combines the other two: a point that is both an outlier and high-leverage is the classic influential observation.
+
+Conventional diagnostics and thresholds are as follows, with the values for this model shown.
+
+```{r}
+#| label: influence
+n_obs   <- nobs(m_mlr)
+k_pred  <- length(coef(m_mlr)) - 1
+lev_cut <- (2 * k_pred + 2) / n_obs
+cook_cut <- 4 / n_obs
+n_lev   <- sum(hatvalues(m_mlr) > lev_cut)
+n_cook  <- sum(cooks.distance(m_mlr) > cook_cut)
+max_cook <- max(cooks.distance(m_mlr))
+n_stdres <- sum(abs(rstandard(m_mlr)) > 2)
+```
+
+| Diagnostic | What it measures | Conventional threshold | This model |
+|:-----|:------|:-----|:----|
+| Standardised residual | How many SDs an observation lies from the fitted value | $\vert e^* \vert > 2$ (or $> 3$) | `r fmt(n_stdres, 0)` of `r fmt(n_obs, 0)` (`r fmt(100 * n_stdres / n_obs, 1)`%) |
+| Leverage $h_{ii}$ | How unusual the predictor values are | $(2k+2)/n$ = `r fmt(lev_cut, 4)` | `r fmt(n_lev, 0)` above |
+| Cook's distance | Combined effect of residual and leverage on the fit | $4/n$ = `r fmt(cook_cut, 4)` | `r fmt(n_cook, 0)` above; maximum `r fmt(max_cook, 3)` |
+| DFBETA | Change in one coefficient when the observation is deleted | Context-dependent | — |
+
+The picture is reassuring despite the counts. The proportion of standardised residuals beyond $\pm 2$ is `r fmt(100 * n_stdres / n_obs, 1)`%, almost exactly the 5% expected by chance under a correct model. More importantly, **the largest Cook's distance is `r fmt(max_cook, 3)`**, far below 1 and only a few multiples of the $4/n$ threshold. No single participant exerts material influence over the fitted model. This is a common and comfortable situation in large datasets: with `r fmt(n_obs, 0)` observations, no one record can dominate. In small studies the same diagnostics frequently identify one or two observations that change the conclusions entirely, which is why they should always be inspected. Observations flagged this way are candidates for **investigation**, never for automatic deletion.
+
+## Tests for error normality {#sec-normality-tests}
+
+Graphical assessment can be supplemented by formal tests. All share the same hypotheses:
+
+$$
+H_0: \text{the errors follow a normal distribution}
+\qquad
+H_A: \text{the errors do not follow a normal distribution}
+$$
+
+Note the direction: a **large** $p$-value is the favourable outcome, since it means the normality hypothesis is not rejected. Four tests are in common use.
+
+| Test | Basis |
+|:--------|:----------------------|
+| **Anderson–Darling** | Measures the squared area between the empirical distribution of the residuals and the fitted normal cumulative distribution, weighted to give extra emphasis to the tails. Smaller $A^2$ indicates better agreement. |
+| **Shapiro–Wilk** | Compares the ordered residuals with the values expected from a normal sample, forming a ratio $W$ that approaches 1 under normality. Small $W$ leads to rejection. |
+| **Ryan–Joiner** | A simpler correlation-based alternative to Shapiro–Wilk: the correlation $R_p$ between the ordered residuals and their normal scores. Values near 1 indicate normality. |
+| **Kolmogorov–Smirnov** (the **Lilliefors** test when parameters are estimated) | Takes the largest vertical distance $D$ between the empirical and the normal cumulative distribution functions. |
+
+```{r}
+#| label: normality-tests
+res_mlr <- residuals(m_mlr)
+sw   <- shapiro.test(res_mlr)
+kstest <- suppressWarnings(ks.test(scale(res_mlr), "pnorm"))
+```
+
+Applied to the residuals of the multivariable model, the Shapiro–Wilk test gives $W$ = `r fmt(sw$statistic, 4)` with $p$ `r fmt_p(sw$p.value)`, and the Kolmogorov–Smirnov test gives $D$ = `r fmt(kstest$statistic, 4)` with $p$ `r fmt_p(kstest$p.value)`. Both reject normality decisively, agreeing with @fig-mlr-diagnostics.
+
+::: {.callout-warning}
+## Normality tests in large samples
+
+These tests should not be given more weight than they deserve. Their power increases with sample size, so in large datasets they reject normality for departures far too small to affect any conclusion. With `r fmt(n_obs, 0)` observations, essentially no real dataset will pass. A significant result therefore establishes *that* the residuals are non-normal, but says nothing about *how much* it matters.
+
+The practical rule is that **plots lead and tests corroborate**. Here the plots show substantial right skew, not a trivial departure, so the test result reflects something real. Had the normal probability plot looked straight, a significant Shapiro–Wilk test at this sample size would have warranted no action at all.
+
+The consequences follow the sensitivity ordering of @sec-slr. Inference about the regression coefficients is fairly robust to non-normality, and at this sample size the central limit theorem makes the confidence intervals in @tbl-mlr broadly trustworthy on this count. Prediction intervals for individual participants are not robust and should not be used from this model.
+:::
+
+## Tests for constant error variance {#sec-variance-tests}
+
+The second condition to be tested formally is equal variance. The hypotheses are
+
+$$
+H_0: \text{the error variance is constant}
+\qquad
+H_A: \text{the error variance is not constant}
+$$
+
+and again a large $p$-value is the favourable outcome. Several tests are available, most of which work by dividing the residuals into $g \ge 2$ groups — commonly by low versus high fitted values — and comparing variability between them.
+
+| Test | Basis and requirements |
+|:--------|:-----------------------|
+| **F-test** | Splits residuals into two groups by predictor value and compares their variances directly through $F^* = s_1^2 / s_2^2$. Requires normal errors. |
+| **Modified Levene**, also called the **Brown–Forsythe** test | Compares the mean absolute deviation of residuals from their **group median** across groups. Being based on medians it is nonparametric and **does not require normal errors**, which makes it the robust choice. |
+| **Breusch–Pagan**, also called the **Cook–Weisberg score test** | Regresses the squared residuals on the predictors and tests whether that relationship is flat. Assumes normal errors. |
+| **Bartlett's test** | Compares group variances through a pooled-variance statistic. Highly sensitive to non-normality; Levene's test is preferred when normality is in doubt. |
+
+```{r}
+#| label: variance-tests
+bp <- bptest(m_mlr)
+fit_grp <- cut(fitted(m_mlr), quantile(fitted(m_mlr), 0:4/4),
+               include.lowest = TRUE, labels = paste("Q", 1:4))
+lev <- car::leveneTest(residuals(m_mlr) ~ fit_grp, center = median)
+grp_sd <- tibble(grp = fit_grp, r = residuals(m_mlr)) |>
+  group_by(grp) |> summarise(sd = sd(r), .groups = "drop")
+```
+
+The **Breusch–Pagan** test gives $\chi^2$ = `r fmt(bp$statistic, 1)` on `r fmt(bp$parameter, 0)` degrees of freedom, $p$ `r fmt_p(bp$p.value)`.
+
+The **modified Levene (Brown–Forsythe)** test, dividing the residuals into quartiles of fitted value, gives $F$ = `r fmt(lev[1, "F value"], 1)` on `r fmt(lev[1, "Df"], 0)` and `r fmt(lev[2, "Df"], 0)` degrees of freedom, $p$ `r fmt_p(lev[1, "Pr(>F)"])`.
+
+Both reject the constant-variance hypothesis emphatically, and here the two tests reinforce one another usefully: Breusch–Pagan assumes normal errors, which has just been shown to fail, but Brown–Forsythe does not require normality and reaches the same conclusion. The failure is not an artefact of the normality violation.
+
+The magnitude is easy to see directly. Residual standard deviations across quartiles of fitted value are `r paste(fmt(grp_sd$sd, 2), collapse = ", ")` mmol/L — the most variable quartile has roughly `r fmt(max(grp_sd$sd) / min(grp_sd$sd), 1)` times the spread of the least. This is a large departure, not a marginal one.
+
+::: {.callout-important}
+## What the diagnostics establish, and what follows
+
+The multivariable model has **adequate linearity** for every predictor (@fig-mlr-resid-preds), **no influential observations** (@sec-assessing), and **no multicollinearity** (@sec-multicollinearity). Independence holds by design. But the errors are **not normally distributed** and, more seriously, their **variance is not constant**.
+
+The practical consequence is specific. The coefficients in @tbl-mlr remain unbiased estimates — heteroscedasticity does not bias $b$. What is unreliable is their **precision**: the standard errors, and therefore the confidence intervals and $p$-values, are computed under an assumption the data contradict.
+
+Two remedies are standard. The first is to **transform** a variable so that the conditions are better met, which is the subject of @sec-transformation. The second is to keep the model and compute **heteroscedasticity-consistent (robust) standard errors**, which are valid without the equal-variance assumption. Both are legitimate; the first changes the model, the second changes only the inference drawn from it.
+:::
+
+# Transformation {#sec-transformation}
+
+@sec-mlr-assessment left the multivariable model with two failed conditions. Transformation — re-expressing a predictor or the outcome on a different scale — is the classical remedy. Because a "linear" model requires linearity only in the parameters (@sec-mlr-model), a model fitted to transformed variables is still a linear model, and all the machinery of the preceding sections continues to apply.
+
+This section covers when to transform a predictor, what other transformations are available, and what happens when they are applied to these data. The results are instructive precisely because they are mixed.
+
+## Log-transforming a predictor {#sec-log-predictor}
+
+The natural logarithm compresses large values and spreads out small ones. Applied to a predictor, it changes the *shape* of that predictor's relationship with the outcome without touching the outcome's error distribution.
+
+::: {.callout-tip}
+## When to consider log-transforming a predictor
+
+Transforming a predictor is the appropriate first remedy when **non-linearity is the only problem** — when independence, normality and equal variance are already satisfactory. Specific indications are:
+
+1. The **residuals-versus-predictor plot is curved**, with the outcome rising steeply at low predictor values and flattening at high ones.
+2. The predictor is **strongly right-skewed**, so that a few large values exert disproportionate leverage.
+3. The predictor plausibly acts **multiplicatively** rather than additively — that is, proportional rather than absolute changes are what matter biologically.
+4. The predictor spans **several orders of magnitude**.
+:::
+
+Two constraints apply. The logarithm is undefined at zero and for negative values, so a strictly positive predictor is required. And transformation is **iterative**: conditions satisfied before a transformation may fail after it, so the diagnostics must be re-checked each time.
+
+Interpretation changes in a way that must be handled carefully. With a predictor on the log scale, the coefficient is no longer a change per unit of the predictor but a change per *multiplicative* change. Using $\log_2$ rather than $\log_e$ makes this directly readable: **the coefficient becomes the change in mean outcome associated with a doubling of the predictor.**
+
+### Application to fasting triglyceride
+
+Among the continuous covariates in the model, fasting triglyceride is the most strongly right-skewed, with a skewness coefficient of `r fmt(mean(scale(na.omit(mssm$fasting_tg))^3), 2)` and values from `r fmt(min(mssm$fasting_tg, na.rm = TRUE), 2)` to `r fmt(max(mssm$fasting_tg, na.rm = TRUE), 2)` mmol/L. It is also conventionally log-transformed in the lipid literature. It is therefore the natural candidate.
+
+```{r}
+#| label: fig-tg-dist
+#| fig-cap: "Distribution of fasting triglyceride on the original and base-2 logarithmic scales. The log transformation converts a strongly right-skewed distribution into an approximately symmetric one, which is the usual motivation for applying it."
+#| fig-height: 3.4
+
+(ggplot(mssm |> filter(!is.na(fasting_tg)), aes(fasting_tg)) +
+   geom_histogram(bins = 60, fill = "grey45") +
+   labs(x = "Fasting triglyceride (mmol/L)", y = "Count", title = "Original scale")) +
+(ggplot(mssm |> filter(!is.na(fasting_tg)), aes(log2(fasting_tg))) +
+   geom_histogram(bins = 60, fill = "grey45") +
+   labs(x = expression(log[2]*"(fasting triglyceride)"), y = "Count",
+        title = "Base-2 log scale"))
+```
+
+@fig-tg-dist confirms that the transformation does what it is supposed to do to the predictor's own distribution. @tbl-log-tg compares the two models.
+
+```{r}
+#| label: tbl-log-tg
+#| tbl-cap: "Comparison of the multivariable model with fasting triglyceride entered untransformed and on a base-2 logarithmic scale. Only the triglyceride term differs between the models; all other covariates are as in @tbl-mlr."
+
+tibble(
+  Model = c("Triglyceride untransformed", "Triglyceride on log₂ scale"),
+  `Triglyceride coefficient` = c(
+    paste0(fmt(coef(m_mlr)["fasting_tg"], 3), " per mmol/L"),
+    paste0(fmt(coef(m_log_tg)["log2(fasting_tg)"], 3), " per doubling")),
+  `R²` = fmt(100 * c(summary(m_mlr)$r.squared, summary(m_log_tg)$r.squared), 2),
+  `Adjusted R²` = fmt(100 * c(summary(m_mlr)$adj.r.squared,
+                              summary(m_log_tg)$adj.r.squared), 2),
+  `Residual SE` = fmt(c(sigma(m_mlr), sigma(m_log_tg)), 3),
+  AIC = fmt(c(AIC(m_mlr), AIC(m_log_tg)), 1)
+) |>
+  gt() |>
+  tab_options(table.font.size = pct(88))
+```
+
+The coefficient on the log scale is `r b(m_log_tg, "log2(fasting_tg)", 3)` mmol/L (95% CI `r ci(m_log_tg, "log2(fasting_tg)", 3)`), meaning that **a doubling of fasting triglyceride is associated with a mean fasting blood sugar higher by `r b(m_log_tg, "log2(fasting_tg)", 3)` mmol/L**, adjusted for the other covariates. That is an interpretable and clinically communicable statement.
+
+::: {.callout-important}
+## The transformation does not improve this model
+
+Despite the strong skew that motivated it, log-transforming triglyceride makes the model slightly **worse**. Adjusted $R^2$ falls from `r fmt(100 * summary(m_mlr)$adj.r.squared, 2)`% to `r fmt(100 * summary(m_log_tg)$adj.r.squared, 2)`%, the residual standard error rises from `r fmt(sigma(m_mlr), 3)` to `r fmt(sigma(m_log_tg), 3)` mmol/L, and AIC rises by `r fmt(AIC(m_log_tg) - AIC(m_mlr), 1)` points. On every criterion the untransformed model fits marginally better.
+
+This is not a failure of the analysis but an illustration of an important principle. **A skewed predictor is not by itself a reason to transform.** The diagnostics in @fig-mlr-resid-preds showed that the linear specification of triglyceride was already adequate — the smoother was essentially flat. There was no non-linearity to fix, so the transformation had nothing to repair, and it slightly degraded a relationship that was already close to linear.
+
+The rule that follows is: **transform in response to a diagnosed problem, not in response to a distribution.** Had these two models been compared only on $R^2$, with the transformation adopted or rejected on that basis, the reasoning would have been backwards. The choice between them here should rest on interpretability — and "per doubling" may well be preferable to "per mmol/L" for communicating to a clinical audience, at a negligible cost in fit.
+:::
+
+## Other transformations {#sec-other-transformations}
+
+Log-transforming a predictor is one option among many. The main alternatives are summarised below.
+
+| Transformation | Form | Typical use |
+|:-----|:-------|:--------------------|
+| Log of predictor | $\mu_Y = \beta_0 + \beta_1 \ln x$ | Outcome rises steeply then flattens; right-skewed predictor |
+| Log of outcome | $\mu_{\ln Y} = \beta_0 + \beta_1 x$ | Right-skewed outcome; variance growing with the mean |
+| Log of both | $\mu_{\ln Y} = \beta_0 + \beta_1 \ln x$ | Multiplicative relationships; coefficient becomes an elasticity |
+| Reciprocal | $\mu_Y = \beta_0 + \beta_1 (1/x)$ | Outcome approaching an asymptote |
+| Exponential | $\mu_Y = \beta_0 + \beta_1 e^{-x}$ | Decay relationships |
+| Square root | $y^* = \sqrt{y}$ | Count outcomes; variance proportional to the mean |
+| Arcsine | $\hat{p}^* = \sin^{-1}(\sqrt{\hat{p}})$ | Proportions (largely superseded by logistic regression) |
+| Power / Box–Cox | $y^* = y^{\lambda}$ | General-purpose variance stabilisation, $\lambda$ estimated from the data |
+
+Two of these deserve comment. The **square-root and arcsine transformations** were historically the standard treatment for counts and proportions, but Poisson and logistic regression now handle those outcomes directly and are usually preferable. The **Box–Cox procedure** provides a systematic way to select a power transformation of the outcome, estimating $\lambda$ by maximum likelihood over a range such as $[-2, 2]$; $\lambda = 1$ means no transformation, $\lambda = 0.5$ the square root, $\lambda = 0$ the logarithm, and $\lambda = -1$ the reciprocal. Values close to a recognisable transformation are conventionally rounded to it for interpretability.
+
+Choosing among these remains partly trial and error. Two pieces of advice apply generally: **do not delete observations merely to make a transformation work**, and **prefer some loss of fit over the loss of a clearly interpretable model**, reporting the choice either way.
+
+### Transforming the outcome
+
+The diagnostics of @sec-mlr-assessment pointed to a problem with the *error distribution* rather than with any predictor's functional form: right-skewed residuals whose variance grows with the fitted value. That combination is the classic indication for transforming the **outcome**.
+
+```{r}
+#| label: boxcox
+bc <- MASS::boxcox(m_mlr, lambda = seq(-2, 2, 0.05), plotit = FALSE)
+lambda_hat <- bc$x[which.max(bc$y)]
+```
+
+The Box–Cox procedure applied to this model estimates $\hat{\lambda}$ = `r fmt(lambda_hat, 2)`, close enough to zero to justify the logarithmic transformation, which is also the more interpretable choice. @tbl-log-fbs and @fig-log-fbs-diag compare the models before and after.
+
+```{r}
+#| label: tbl-log-fbs
+#| tbl-cap: "The multivariable model with fasting blood sugar untransformed and log-transformed. R² values are not directly comparable between the two models because the outcomes are on different scales; the diagnostic quantities are."
+
+bp_log <- bptest(m_log_fbs)
+sw_log <- shapiro.test(residuals(m_log_fbs))
+
+tibble(
+  Quantity = c("Adjusted R²  (%)", "Residual skewness", "Shapiro–Wilk W",
+               "Breusch–Pagan χ²", "Breusch–Pagan p"),
+  `Outcome untransformed` = c(
+    fmt(100 * summary(m_mlr)$adj.r.squared, 2),
+    fmt(mean(scale(residuals(m_mlr))^3), 2),
+    fmt(sw$statistic, 3),
+    fmt(bp$statistic, 1),
+    fmt_p(bp$p.value)),
+  `Outcome log-transformed` = c(
+    fmt(100 * summary(m_log_fbs)$adj.r.squared, 2),
+    fmt(mean(scale(residuals(m_log_fbs))^3), 2),
+    fmt(sw_log$statistic, 3),
+    fmt(bp_log$statistic, 1),
+    fmt_p(bp_log$p.value))
+) |>
+  gt() |>
+  tab_options(table.font.size = pct(88))
+```
+
+```{r}
+#| label: fig-log-fbs-diag
+#| fig-cap: "Diagnostic plots before and after log-transforming the outcome. The top row is the original model, the bottom row the log-transformed model. The transformation substantially improves the symmetry of the residuals and reduces, but does not remove, the fan shape in the residuals-versus-fitted plot."
+#| fig-width: 9
+#| fig-height: 7
+
+(p_resid_fit(m_mlr, "Original outcome: residuals vs fitted") |
+   p_qq(m_mlr, "Original outcome: normal probability plot")) /
+((p_resid_fit(m_log_fbs, "Log outcome: residuals vs fitted") +
+    labs(x = "Fitted value (log mmol/L)", y = "Residual (log scale)")) |
+   p_qq(m_log_fbs, "Log outcome: normal probability plot"))
+```
+
+The improvement in the residual distribution is substantial. Residual skewness falls from `r fmt(mean(scale(residuals(m_mlr))^3), 2)` to `r fmt(mean(scale(residuals(m_log_fbs))^3), 2)`, and the Shapiro–Wilk statistic rises from `r fmt(sw$statistic, 3)` to `r fmt(sw_log$statistic, 3)`. The normal probability plot in @fig-log-fbs-diag is far closer to a straight line, and adjusted $R^2$ on the log scale is `r fmt(100 * summary(m_log_fbs)$adj.r.squared, 1)`%.
+
+::: {.callout-important}
+## The transformation helps substantially but does not fix the problem
+
+Both formal tests still reject decisively: Shapiro–Wilk $p$ `r fmt_p(sw_log$p.value)` and Breusch–Pagan $p$ `r fmt_p(bp_log$p.value)`. @fig-log-fbs-diag shows why — the residual spread still widens with the fitted value, less dramatically than before but visibly.
+
+It would be easy, and wrong, to present the log transformation as having solved the problem. It has improved matters considerably and has not resolved them. Reporting a transformed model without re-examining its diagnostics is a common error, and it is precisely the iterative re-checking urged in @sec-log-predictor that catches it.
+
+Where does that leave the analysis? Three defensible positions, in increasing order of effort:
+
+1. **Keep the untransformed model and use heteroscedasticity-consistent standard errors.** The coefficients keep their direct mmol/L interpretation, and the inference no longer depends on the equal-variance assumption.
+2. **Use the log-transformed model**, accepting the change of interpretation and the residual imperfection, and report the diagnostics honestly.
+3. **Use a model designed for a skewed positive outcome**, such as a gamma regression with a log link, which specifies a mean–variance relationship appropriate to the data rather than requiring a transformation to manufacture one.
+:::
+
+Interpretation on the log scale is worth stating explicitly, since it changes from additive to multiplicative. Exponentiating a coefficient converts it into a ratio of geometric means. For history of diabetes, the coefficient of `r fmt(coef(m_log_fbs)["hx_dm2Yes"], 3)` gives $e^{`r fmt(coef(m_log_fbs)["hx_dm2Yes"], 3)`}$ = `r fmt(exp(coef(m_log_fbs)["hx_dm2Yes"]), 3)`, so participants with a diabetes history have a geometric mean fasting blood sugar about `r fmt(100 * (exp(coef(m_log_fbs)["hx_dm2Yes"]) - 1), 0)`% higher than those without, adjusted for the other covariates. Note that back-transforming the fitted values by exponentiating gives geometric rather than arithmetic means, which are systematically lower; this is a well-known trap when predictions are required on the original scale.
+
+## Generalized additive models {#sec-gam}
+
+Transformation addresses non-linearity by requiring the analyst to *choose* a functional form — a logarithm, a square root, a reciprocal — and then imposing it. **Generalized additive models (GAMs)** take a different approach: they let the data determine the shape.
+
+A GAM replaces the linear term $\beta_j x_j$ with a smooth function $f_j(x_j)$ estimated from the data:
+
+$$
+g\left( E\{Y\} \right) = \beta_0 + f_1(x_1) + f_2(x_2) + \cdots + f_k(x_k)
+$$
+
+where $g$ is a link function, equal to the identity for a continuous outcome of the kind modelled in this chapter. Each $f_j$ is typically built from splines, and its wiggliness is controlled by a penalty chosen automatically, usually by cross-validation or restricted maximum likelihood. A linear term is a special case: where the data support a straight line, the fitted smooth *is* a straight line.
+
+::: {.callout-tip}
+## Strengths of GAMs over multiple linear regression
+
+1. **The shape of the exposure–outcome relationship is estimated, not assumed.** This matters in epidemiology, where dose–response shape is often the scientific question.
+2. **Continuous exposures need not be categorised.** Splitting a continuous variable into quartiles to accommodate non-linearity discards information and reduces power; a smooth term avoids the compromise entirely.
+3. **Non-monotone and threshold relationships can be captured** — J-shaped and U-shaped associations, common for blood pressure, body mass index and many biomarkers, which no single transformation represents well.
+4. **The degree of smoothing is chosen by the fitting procedure**, through a penalty on wiggliness, rather than by the analyst inspecting plots and choosing a polynomial degree.
+5. **Additivity is retained**, so each covariate's contribution can still be examined and plotted one at a time. A GAM is far more interpretable than a fully non-parametric model.
+:::
+
+The costs should be stated as plainly as the benefits. There is **no single coefficient to report** for a smoothed covariate — the result is a curve, conveyed by a plot and an effective-degrees-of-freedom value, which is harder to tabulate and to communicate to non-statistical audiences. Flexible models can **overfit**, following features of the sample that will not replicate. And where a linear term is adequate, as @fig-mlr-resid-preds indicates is the case for every predictor in this chapter's model, a GAM adds complexity without adding insight.
+
+In R, GAMs are fitted with the `gam()` function of the **mgcv** package, using terms of the form `s(age)` to request a smooth. Readers whose diagnostics show genuine curvature that no simple transformation resolves should regard GAMs as the natural next step.
+
+# Interaction {#sec-interaction}
+
+Every model fitted so far has made an assumption so quietly that it has not yet been stated: that each covariate's association with fasting blood sugar is the same for everyone. The coefficient for age in @tbl-mlr is a single number, applied identically to men and women, to rural and urban participants, and to those with and without diabetes. This section examines that assumption, and shows that in these data it is wrong.
+
+## Additive effects {#sec-additive}
+
+::: {.callout-note}
+## Definition: additive effects
+
+Two predictors have **additive effects** when the response function can be written as a sum of separate functions of each predictor:
+
+$$
+\mu_Y = f_1(x_1) + f_2(x_2) + \cdots + f_k(x_k)
+$$
+
+The effect of each predictor on the mean outcome is then the same regardless of the values taken by the others.
+:::
+
+The first-order model $y_i = \beta_0 + \beta_1 x_{i1} + \beta_2 x_{i2} + \epsilon_i$ is additive by construction. Its geometry is best seen with one continuous and one binary predictor. Writing $x_2 = 0$ and $x_2 = 1$ for the two groups:
+
+$$
+\text{Group } x_2 = 0: \quad \mu_Y = \beta_0 + \beta_1 x_1
+$$
+$$
+\text{Group } x_2 = 1: \quad \mu_Y = (\beta_0 + \beta_2) + \beta_1 x_1
+$$
+
+The two lines have **the same slope** $\beta_1$ and differ only in their intercepts, by the constant amount $\beta_2$.
+
+::: {.callout-tip}
+## The visual signature of additivity is parallel lines
+
+Under an additive model, the fitted lines for different groups are exactly parallel. The vertical distance between them, $\beta_2$, is constant at every value of $x_1$ — so a single number describes the group difference, and a single slope describes the effect of $x_1$ in both groups.
+:::
+
+@fig-additive shows what the additive model of @tbl-mlr implies for the relationship between age and fasting blood sugar in participants with and without a history of diabetes.
+
+```{r}
+#| label: fig-additive
+#| fig-cap: "Predicted fasting blood sugar by age and history of diabetes, as implied by the additive multivariable model of @tbl-mlr. The two fitted lines are exactly parallel by construction: the model permits the groups to differ in level but forces them to share a single age slope. Predictions are averaged over the other covariates."
+#| fig-height: 3.8
+
+emmip(m_mlr, hx_dm2 ~ age, at = list(age = seq(20, 85, length.out = 30)),
+      CIs = TRUE, plotit = TRUE) +
+  labs(x = "Age (years)", y = "Predicted fasting blood sugar (mmol/L)",
+       colour = "History of diabetes", fill = "History of diabetes") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+The parallelism in @fig-additive is not a finding. It is an **assumption**, imposed by a model that contains no term permitting the slopes to differ. Whether the data support it is a separate question.
+
+## Multiplicative effects and interaction {#sec-interaction-concept}
+
+::: {.callout-note}
+## Definition: interaction
+
+Two predictors **interact** when the effect of one on the outcome depends on the value of the other. Equivalently, the response function is **not additive** — it cannot be written as a sum of separate functions of each predictor:
+
+$$
+\mu_Y \ne f_1(x_1) + f_2(x_2) + \cdots + f_k(x_k)
+$$
+:::
+
+Interaction is introduced into a linear model by including the **product** of the two predictors as an additional term:
+
+$$
+y_i = \beta_0 + \beta_1 x_{i1} + \beta_2 x_{i2} + \beta_3 x_{i1} x_{i2} + \epsilon_i
+$$
+
+The product $x_{i1} x_{i2}$ is the **two-way interaction term**. The model remains a linear model — setting $x_{i3} = x_{i1}x_{i2}$ recovers the standard three-predictor form — which is why interaction requires no new estimation theory.
+
+To see what the product term does, separate the group-specific equations as before:
+
+$$
+\text{Group } x_2 = 0: \quad \mu_Y = \beta_0 + \beta_1 x_1
+$$
+$$
+\text{Group } x_2 = 1: \quad \mu_Y = (\beta_0 + \beta_2) + (\beta_1 + \beta_3) x_1
+$$
+
+Now the lines differ in **both** intercept and slope. The interaction coefficient $\beta_3$ is precisely the **difference between the two groups' slopes**. Non-parallel lines are the visual signature of interaction, exactly as parallel lines are the signature of additivity.
+
+The same logic applies when both predictors are continuous. For $E\{Y\} = 10 + 2x_1 + 5x_2 + 0.5 x_1 x_2$, the slope with respect to $x_1$ is $2 + 0.5x_2$, which depends on $x_2$. At $x_2 = 1$ the relationship is $E\{Y\} = 15 + 2.5x_1$; at $x_2 = 3$ it is $E\{Y\} = 25 + 3.5x_1$. Rather than two lines, the fitted surface becomes a twisted plane.
+
+::: {.callout-warning}
+## Three rules for models containing interaction
+
+**1. Main effects change meaning.** With $x_1x_2$ in the model, $\beta_1$ is no longer "the effect of $x_1$". It is the effect of $x_1$ **when $x_2 = 0$** — a conditional effect at one specific value. If $x_2 = 0$ is outside the observed range, $\beta_1$ may have no interpretable meaning at all. Centring continuous predictors before forming their product makes the main effects interpretable at average values and is standard practice.
+
+**2. Respect the hierarchy principle.** If an interaction term is included, both of its component main effects should be retained, **whether or not they are individually significant**. Omitting a main effect while keeping the product imposes a constraint that is rarely intended.
+
+**3. Prefer one F-test to several t-tests.** When several interaction terms are assessed together, a single general linear F-test (@sec-f-test) is preferable to a series of individual $t$-tests, because each additional test inflates the overall error rate.
+:::
+
+Epidemiologists will recognise interaction under other names. **Effect modification** and **moderation** describe the same statistical phenomenon: a third variable that alters the strength or direction of an exposure–outcome association. A moderator is distinct from a confounder or a mediator, both discussed in @sec-crude-adjusted — a confounder biases an estimate, a mediator transmits it, and a moderator changes it depending on who you are.
+
+## Interaction between two numerical covariates {#sec-int-cont}
+
+The multivariable model contains six continuous covariates, and any pair might interact. Three plausible pairs were specified for testing before any were fitted, each motivated by the metabolic syndrome hypothesis that adiposity and dyslipidaemia act together rather than separately. Each was added in turn to the model of @tbl-mlr and assessed with a general linear F-test.
+
+```{r}
+#| label: tbl-int-search
+#| tbl-cap: "Three candidate numerical-by-numerical interactions, each added in turn to the multivariable model and tested against it with a general linear F-test. The pairs were specified in this order before fitting."
+
+int_search |>
+  mutate(
+    `F` = fmt(f, 2),
+    `p-value` = if_else(p < 0.001, "< 0.001", fmt(p, 4)),
+    Conclusion = if_else(p < 0.05, "Evidence of interaction", "No evidence")
+  ) |>
+  select(Pair = pair, `F`, `p-value`, Conclusion) |>
+  gt() |>
+  tab_options(table.font.size = pct(88))
+```
+
+::: {.callout-note}
+## Disclosure of the search
+
+Three interactions were examined and two reached conventional significance. The strongest, **waist–hip ratio by fasting triglyceride**, is presented in detail below. This search is reported because it affects interpretation: a $p$-value obtained after three tests is weaker evidence than the same value from a single pre-specified hypothesis. A Bonferroni adjustment across the three tests would require $p < 0.017$, which this result meets comfortably at $p$ = `r fmt(int_search$p[3], 5)`. An interaction identified in this way should nonetheless be described as **exploratory** and reported together with the search that produced it.
+:::
+
+```{r}
+#| label: tbl-int-cont
+#| tbl-cap: "Multivariable model with an added interaction between waist-hip ratio and fasting triglyceride. Only the terms involved in the interaction are shown; the remaining covariates are as in @tbl-mlr."
+
+anova_cont <- anova(m_mlr, m_int_cont)
+
+tidy(m_int_cont, conf.int = TRUE) |>
+  filter(term %in% c("whr", "fasting_tg", tm_cont)) |>
+  mutate(Term = case_when(term == "whr" ~ "Waist-hip ratio",
+                          term == "fasting_tg" ~ "Fasting triglyceride (mmol/L)",
+                          TRUE ~ "Waist-hip ratio x triglyceride"),
+         b = fmt(estimate, 5),
+         CI = paste0(fmt(conf.low, 5), " to ", fmt(conf.high, 5)),
+         p = if_else(p.value < 0.001, "< 0.001", fmt(p.value, 4))) |>
+  select(Term, b, `95% CI` = CI, p) |>
+  gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+The interaction coefficient is `r b(m_int_cont, tm_cont, 4)` (95% CI `r ci(m_int_cont, tm_cont, 4)`), and the general linear F-test comparing this model with the additive model gives $F$ = `r fmt(anova_cont$F[2], 2)` on 1 and `r fmt(anova_cont$Res.Df[2], 0)` degrees of freedom, $p$ = `r fmt(anova_cont[["Pr(>F)"]][2], 5)`.
+
+The positive sign means the two covariates' effects are **super-additive**: the association between triglyceride and fasting blood sugar becomes *stronger* as central adiposity increases. Because the interaction coefficient is the amount by which the triglyceride slope changes per one-unit increase in waist–hip ratio, the slope at any given WHR is obtained by substitution:
+
+$$
+\text{slope of triglyceride at WHR } w = `r fmt(coef(m_int_cont)["fasting_tg"], 4)` + (`r fmt(coef(m_int_cont)[tm_cont], 4)` \times w)
+$$
+
+```{r}
+#| label: slopes-cont
+slope_at <- function(w) coef(m_int_cont)["fasting_tg"] +
+  coef(m_int_cont)[tm_cont] * w
+whr_q <- quantile(mssm$whr, c(0.25, 0.5, 0.75))
+```
+
+At the lower quartile of waist–hip ratio (`r fmt(whr_q[1], 2)`) the triglyceride slope is `r fmt(slope_at(whr_q[1]), 3)` mmol/L per mmol/L; at the median (`r fmt(whr_q[2], 2)`) it is `r fmt(slope_at(whr_q[2]), 3)`; and at the upper quartile (`r fmt(whr_q[3], 2)`) it is `r fmt(slope_at(whr_q[3]), 3)`. Across the interquartile range of central adiposity, in other words, the strength of the triglyceride–glycaemia association increases by roughly `r fmt(100 * (slope_at(whr_q[3]) / slope_at(whr_q[1]) - 1), 0)`%. @fig-int-cont displays this.
+
+```{r}
+#| label: fig-int-cont
+#| fig-cap: "Predicted fasting blood sugar against fasting triglyceride at the quartiles of waist-hip ratio, from the model containing their interaction. The lines are not parallel: the triglyceride slope steepens as central adiposity increases, so the two exposures reinforce one another."
+#| fig-height: 3.8
+
+emmip(m_int_cont, whr ~ fasting_tg,
+      at = list(whr = as.numeric(round(whr_q, 2)),
+                fasting_tg = seq(0.5, 6, length.out = 30)),
+      CIs = TRUE) +
+  labs(x = "Fasting triglyceride (mmol/L)",
+       y = "Predicted fasting blood sugar (mmol/L)",
+       colour = "Waist-hip ratio", fill = "Waist-hip ratio") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+The finding is biologically coherent: central obesity and hypertriglyceridaemia are both components of the metabolic syndrome, and the model suggests their effects on fasting glucose compound rather than merely add. Two observations nonetheless temper it. The main effects in @tbl-int-cont are now negative and statistically significant, which looks alarming until one recalls rule 1 below — each is the effect of one variable when the *other* is zero, and neither zero triglyceride nor zero waist–hip ratio exists. And the gain in explanatory power is slight: adjusted $R^2$ rises from `r fmt(100 * summary(m_mlr)$adj.r.squared, 2)`% to `r fmt(100 * summary(m_int_cont)$adj.r.squared, 2)`%. **The interaction is real and interpretable, but it refines the model rather than transforming it.**
+
+## Interaction between a numerical and a categorical covariate {#sec-int-cat}
+
+The second interaction was specified in advance rather than discovered: between **age** and **history of diabetes**. It is the more instructive of the two.
+
+```{r}
+#| label: tbl-int-cat
+#| tbl-cap: "Multivariable model with an added interaction between age and history of diabetes. Only the terms involved in the interaction are shown; the remaining covariates are as in @tbl-mlr."
+
+anova_cat <- anova(m_mlr, m_int_cat)
+
+tidy(m_int_cat, conf.int = TRUE) |>
+  filter(term %in% c("age", "hx_dm2Yes", "age:hx_dm2Yes")) |>
+  mutate(Term = c("Age (years)", "History of diabetes (yes vs no)",
+                  "Age x diabetes history")[
+                    match(term, c("age", "hx_dm2Yes", "age:hx_dm2Yes"))],
+         b = fmt(estimate, 5),
+         CI = paste0(fmt(conf.low, 5), " to ", fmt(conf.high, 5)),
+         p = if_else(p.value < 0.001, "< 0.001", fmt(p.value, 4))) |>
+  select(Term, b, `95% CI` = CI, p) |>
+  gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+The interaction coefficient is `r b(m_int_cat, "age:hx_dm2Yes", 4)` (95% CI `r ci(m_int_cat, "age:hx_dm2Yes", 4)`), and the general linear F-test gives $F$ = `r fmt(anova_cat$F[2], 2)` on 1 and `r fmt(anova_cat$Res.Df[2], 0)` degrees of freedom, $p$ `r fmt_p(anova_cat[["Pr(>F)"]][2])`. This is strong evidence against the additive model.
+
+### Recovering the two age slopes
+
+The interaction coefficient is the *difference* between slopes, so each group's slope is obtained by substitution:
+
+```{r}
+#| label: slopes-cat
+sl_no  <- coef(m_int_cat)["age"]
+sl_yes <- coef(m_int_cat)["age"] + coef(m_int_cat)["age:hx_dm2Yes"]
+emt <- emtrends(m_int_cat, ~ hx_dm2, var = "age") |> as_tibble()
+```
+
+$$
+\text{No diabetes history:} \quad \text{slope} = `r fmt(sl_no, 5)` \ \text{mmol/L per year}
+$$
+$$
+\text{Diabetes history:} \quad \text{slope} = `r fmt(sl_no, 5)` + (`r fmt(coef(m_int_cat)["age:hx_dm2Yes"], 5)`) = `r fmt(sl_yes, 5)` \ \text{mmol/L per year}
+$$
+
+@tbl-emtrends confirms these with their confidence intervals, computed as estimated marginal trends.
+
+```{r}
+#| label: tbl-emtrends
+#| tbl-cap: "Estimated slope of fasting blood sugar on age, separately by history of diabetes, from the interaction model. The two slopes have opposite signs and their confidence intervals do not overlap."
+
+emt |>
+  mutate(Group = paste("History of diabetes:", hx_dm2),
+         Slope = fmt(age.trend, 5),
+         CI = paste0(fmt(lower.CL, 5), " to ", fmt(upper.CL, 5))) |>
+  select(Group, `Slope (mmol/L per year)` = Slope, `95% CI` = CI) |>
+  gt() |>
+  tab_options(table.font.size = pct(90))
+```
+
+::: {.callout-important}
+## The two groups behave in opposite directions
+
+Among participants **without** a history of diabetes, fasting blood sugar rises with age by `r fmt(sl_no, 4)` mmol/L per year — roughly `r fmt(10 * sl_no, 2)` mmol/L per decade, a small but positive gradient consistent with the gradual decline in glucose tolerance expected with ageing.
+
+Among participants **with** a history of diabetes, fasting blood sugar **falls** with age, by `r fmt(abs(sl_yes), 4)` mmol/L per year, or about `r fmt(abs(10 * sl_yes), 2)` mmol/L per decade.
+
+The additive model of @tbl-mlr, forced to fit a single slope to both groups, returned `r b(m_mlr, "age", 4)` mmol/L per year and no evidence of any age association at all. It arrived at that null result by averaging two real and opposing gradients.
+:::
+
+@fig-int-cat shows the two fitted relationships.
+
+```{r}
+#| label: fig-int-cat
+#| fig-cap: "Predicted fasting blood sugar by age and history of diabetes, from the model containing their interaction. Compare with @fig-additive, where the same two lines were constrained to be parallel. Here they converge sharply: among those without a diabetes history the line rises gently, while among those with one it falls. Shaded bands are 95% confidence intervals."
+#| fig-height: 4
+
+emmip(m_int_cat, hx_dm2 ~ age, at = list(age = seq(20, 85, length.out = 30)),
+      CIs = TRUE) +
+  labs(x = "Age (years)", y = "Predicted fasting blood sugar (mmol/L)",
+       colour = "History of diabetes", fill = "History of diabetes") +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+#| label: emm-ages
+emm_ages <- emmeans(m_int_cat, ~ age | hx_dm2,
+                    at = list(age = c(30, 50, 70))) |> as_tibble()
+get_emm <- function(a, g) {
+  emm_ages$emmean[emm_ages$age == a & emm_ages$hx_dm2 == g]
+}
+```
+
+The gap between the groups narrows markedly across the age range. At age 30 the adjusted mean fasting blood sugar is `r fmt(get_emm(30, "No"), 2)` mmol/L without a diabetes history and `r fmt(get_emm(30, "Yes"), 2)` mmol/L with one, a difference of `r fmt(get_emm(30, "Yes") - get_emm(30, "No"), 2)` mmol/L. By age 70 the corresponding means are `r fmt(get_emm(70, "No"), 2)` and `r fmt(get_emm(70, "Yes"), 2)` mmol/L, a difference of only `r fmt(get_emm(70, "Yes") - get_emm(70, "No"), 2)` mmol/L.
+
+### Interpreting the finding
+
+A statistical result of this kind invites explanation, and explanation should be clearly separated from evidence. A plausible reading is that younger people with diagnosed diabetes represent a more severe phenotype — earlier onset, often poorer glycaemic control — whereas older people with a diabetes diagnosis include many with milder, later-onset disease detected through screening and managed for years with treatment. Survivor effects may contribute, since those with the worst control may not survive to older ages. **This is a hypothesis consistent with the data, not a finding of this analysis.** The cross-sectional design cannot distinguish among these explanations, and nothing in the model tests them.
+
+What the analysis does establish is methodological, and it is the central lesson of this section.
+
+::: {.callout-tip}
+## Reporting practice when interaction is present
+
+1. **Report stratum-specific effects, not a single adjusted coefficient.** Once interaction is established, "the effect of age" does not exist as a single quantity. Report `r fmt(sl_no, 4)` mmol/L per year for those without a diabetes history and `r fmt(sl_yes, 4)` for those with one, each with its confidence interval.
+2. **Do not interpret the main effects in the usual way.** In @tbl-int-cat the coefficient for diabetes history, `r b(m_int_cat, "hx_dm2Yes", 3)`, is the group difference **at age zero** — an extrapolation far outside the observed range of `r fmt(min(mssm$age, na.rm = TRUE), 0)` to `r fmt(max(mssm$age, na.rm = TRUE), 0)` years, and not a meaningful quantity.
+3. **Test interaction deliberately, and only where there is reason to.** Every pair of covariates could be multiplied together; testing them all guarantees spurious findings. Pre-specify the interactions that subject-matter knowledge suggests, and disclose any search, as was done in @sec-int-cont.
+4. **Remember that interaction is scale-dependent.** Two variables that interact on the additive scale used here may not interact on a multiplicative scale, and vice versa. A statement about interaction is always a statement about a particular scale of measurement.
+:::
+
+The contrast between @fig-additive and @fig-int-cat is the strongest argument in this chapter for checking assumptions rather than accepting them. The additive model was not obviously deficient: its diagnostics were no worse than any other model here, and its age coefficient was reported with a respectable standard error. It was nonetheless concealing two opposing relationships behind a single null result.
+
+# Conclusion {#sec-conclusion}
+
+This chapter developed linear regression from a single predictor to a multivariable model with interaction, checking the model's assumptions at each stage and applying every technique to the same outcome in the same dataset. Six learning points summarise what that exercise established. Each is drawn from a result the chapter actually produced, and each is stated as guidance for the reader's own analyses.
+
+::: {.callout-tip}
+## Six learning points
+
+**1. Statistical significance and explanatory power are different things, and large samples separate them completely.**
+
+In @sec-slr, `r fmt(n_sig, 0)` of `r n_cov` covariates were significantly associated with fasting blood sugar, yet apart from history of diabetes none explained more than `r fmt(100 * r2_next, 1)`% of its variance. Marital status achieved $p$ = `r fmt(summary(m_mar)$coefficients["maritalSingle", 4], 4)` while explaining `r fmt(100 * summary(m_mar)$r.squared, 2)`% of the variation — about one part in `r fmt(round(1 / summary(m_mar)$r.squared), 0)`. With several thousand observations, a $p$-value establishes only that an association is not zero; it says nothing about whether the association matters. Report the effect size with its confidence interval, let $R^2$ describe explanatory power, and let neither substitute for the other.
+
+**2. The regression equation is the deliverable, and interpretation follows from it mechanically.**
+
+Writing out the fitted equation with its units makes interpretation almost automatic, for continuous and categorical predictors alike. A slope of `r b(m_bmi, "bmi")` mmol/L per kg/m² becomes the more communicable `r fmt(5 * coef(m_bmi)["bmi"], 3)` mmol/L per 5 kg/m²; and for an indicator variable, the intercept is the reference group's mean while the coefficient is the difference between groups, as @sec-worked-categorical verified against the directly computed means. Rescale a coefficient whenever its natural unit is much smaller or larger than the spread of the variable — the waist–hip ratio coefficient in @sec-mlr-fit is the clearest case. Keep the units attached, state the direction, and check that the intercept is meaningful before interpreting it — at a body mass index of zero, it is not.
+
+**3. Fit the model, then look at the residuals — and let the plots lead the tests.**
+
+Both simple models in @sec-slr-assessment produced entirely respectable coefficient tables, and both had markedly skewed residuals — the body mass index model with non-constant variance as well. A coefficient table looks identical whether the assumptions hold or fail. Note too that the two models failed differently: the marital status model passed the constant-variance check that the body mass index model failed, so assumptions must be checked for the model actually fitted rather than assumed to carry over from another model of the same outcome. Residuals-versus-fitted plots reveal non-constant variance and non-linearity, normal probability plots reveal skew, and residuals plotted against omitted predictors reveal what the model has left out — as @fig-bmi-resid-others did, arguing for a multivariable model on evidence rather than assertion. Formal tests corroborate what the plots show; at these sample sizes they reject essentially any real data, so a significant Shapiro–Wilk result is informative only when the plot agrees.
+
+**4. Adjustment can overturn a crude result, and only subject-matter knowledge decides which result answers the question.**
+
+The clearest finding in this chapter is that age, strongly associated with fasting blood sugar when examined alone (`r fmt(crude_tab$crude[crude_tab$term == "age"], 4)` mmol/L per year, $p$ = `r fmt_psci(crude_tab$crude_p[crude_tab$term == "age"])`), showed no association whatever after adjustment (`r b(m_mlr, "age", 4)` mmol/L per year, $p$ = `r fmt_p(summary(m_mlr)$coefficients["age", 4])`). Adjustment removed a real association because the covariates transmitting it — body mass index, blood pressure, diabetes status — are plausibly consequences of ageing rather than confounders of it. Confounders and mediators are statistically indistinguishable; both change the coefficient. Always report crude and adjusted estimates side by side, and justify the covariate set on causal reasoning rather than on which variables happen to be significant.
+
+**5. Test groups of parameters with the general linear F-test, and check the assumptions that individual coefficients cannot reveal.**
+
+Ethnicity occupies three coefficients in the model, one of which is not significant. Reading them individually gives no answer to "does ethnicity matter?"; the general linear F-test does, giving $F$ = `r fmt(f_race, 2)` on `r fmt(df_r - df_f, 0)` and `r fmt(df_f, 0)` degrees of freedom, $p$ < 0.001 (@sec-f-test). One test is also safer than three, and unlike the individual contrasts it does not depend on the choice of reference category. Two further problems are invisible in a coefficient table read on its own. @sec-mlr-assessment showed the model failing the constant-variance condition emphatically (Breusch–Pagan $\chi^2$ = `r fmt(bp$statistic, 0)`, $p$ < 0.001), which leaves the coefficients unbiased but their standard errors unreliable. And @sec-collinearity-demo showed that adding waist circumference to a model already containing body mass index and waist–hip ratio drove all three adiposity terms to non-significance while improving the fit not at all — a model can appear to show that adiposity does not matter simply because it has been asked to measure it three times.
+
+**6. Check whether effects are additive before reporting a single adjusted coefficient.**
+
+Every model before @sec-interaction assumed each covariate acts identically for everyone. For age that assumption was wrong. Allowing the age slope to differ by diabetes history gave `r fmt(sl_no, 4)` mmol/L per year among participants without a history and `r fmt(sl_yes, 4)` among those with one — gradients of opposite sign, with an interaction test of $F$ = `r fmt(anova_cat$F[2], 1)`, $p$ < 0.001. The additive model's null age coefficient was the average of two real and opposing relationships. Once interaction is established, report stratum-specific effects rather than a single slope, do not interpret main effects in the usual way, and pre-specify the interactions worth testing — disclosing any search, as @sec-int-cont does.
+:::
+
+## Closing remarks
+
+Two themes run through these points. The first is that **the model's output is never self-validating**. Coefficients, standard errors and $p$-values are produced identically whether the assumptions hold or fail, whether a crucial covariate is omitted, and whether an effect is uniform or reverses direction between subgroups. Everything of value in a regression analysis comes from what the analyst does after the model is fitted.
+
+The second is that **statistics cannot supply the subject-matter reasoning it depends on**. Whether to adjust for a variable, whether an association is worth reporting, whether an interaction is plausible or an artefact of searching, and whether any of it supports a causal claim are questions that regression poses but cannot answer. The techniques in this chapter make those questions precise and quantify what the data say about them. Answering them remains the responsibility of the researcher.
+
+Readers ready to go further will find the natural extensions close at hand. Logistic regression handles binary outcomes, Poisson and negative binomial regression handle counts, Cox regression handles time to event, and mixed-effects models handle grouped or repeated measurements. Each relaxes one assumption of the model developed here while retaining its structure, its vocabulary and its diagnostic logic. The effort invested in understanding linear regression thoroughly is repaid in all of them.
+
+# References {#sec-references}
+
+## Textbooks
+
+Faraway JJ. *Linear Models with R*. 2nd ed. Boca Raton, FL: Chapman & Hall/CRC; 2014. ISBN 9781439887332. — Practical treatment of linear models using R, useful alongside this chapter for the computational side.
+
+Hosmer DW Jr, Lemeshow S, Sturdivant RX. *Applied Logistic Regression*. 3rd ed. Hoboken, NJ: John Wiley & Sons; 2013. ISBN 9780470582473. — Chapter 4 on model-building strategy, and the sections on mediation and statistical interaction in the Special Topics chapter, apply directly to the material in @sec-mlr and @sec-interaction.
+
+Katz MH. *Multivariable Analysis: A Practical Guide for Clinicians and Public Health Researchers*. 3rd ed. Cambridge: Cambridge University Press; 2011. ISBN 9780521141079. — Explains multivariable methods in plain language with minimal mathematics; a good companion for readers who want the concepts without the derivations.
+
+Kutner MH, Nachtsheim CJ, Neter J, Li W. *Applied Linear Statistical Models*. 5th ed. New York: McGraw-Hill/Irwin; 2005. ISBN 9780073108742. — The standard reference for the material in this chapter. Chapters 6, 7 and 8 cover multiple regression, model diagnostics and remedial measures respectively.
+
+## Online course material
+
+Penn State University. *STAT 462: Applied Regression Analysis*. Online course notes, Department of Statistics, Penn State Eberly College of Science. Available at <https://online.stat.psu.edu/stat462/>. Accessed 18 August 2026. The specific sections drawn on in this chapter are:
+
+| Section | Topic | Used in |
+|:---|:-------|:----|
+| [2.1](https://online.stat.psu.edu/stat462/node/91/) | What is simple linear regression? | @sec-slr |
+| [2.2](https://online.stat.psu.edu/stat462/node/92/) | What is the "best fitting line"? | @sec-slr |
+| [2.3](https://online.stat.psu.edu/stat462/node/93/) | The simple linear regression model | @sec-slr |
+| [2.5](https://online.stat.psu.edu/stat462/node/95/) | The coefficient of determination, r-squared | @sec-r2 |
+| [2.7](https://online.stat.psu.edu/stat462/node/97/) | Coefficient of determination and correlation examples | @sec-r2 |
+| [2.8](https://online.stat.psu.edu/stat462/node/98/) | R-squared cautions | @sec-r2-cautions |
+| [4.1](https://online.stat.psu.edu/stat462/node/116/) | Residuals | @sec-residuals |
+| [4.2](https://online.stat.psu.edu/stat462/node/117/) | Residuals vs. fits plot | @sec-resid-fit |
+| [4.3](https://online.stat.psu.edu/stat462/node/118/) | Residuals vs. predictor plot | @sec-resid-pred |
+| [4.4](https://online.stat.psu.edu/stat462/node/120/) | Identifying specific problems using residual plots | @sec-resid-problems |
+| [4.6](https://online.stat.psu.edu/stat462/node/122/) | Normal probability plot of residuals | @sec-npp |
+| [4.8](https://online.stat.psu.edu/stat462/node/124/) | Further residual plot examples | @sec-resid-further |
+| [Lesson 5](https://online.stat.psu.edu/stat462/node/83/) | Multiple linear regression model and evaluation | @sec-mlr |
+| [5.3](https://online.stat.psu.edu/stat462/node/131/) | The multiple linear regression model | @sec-mlr-model |
+| [5.6](https://online.stat.psu.edu/stat462/node/135/) | The general linear F-test | @sec-f-test |
+| [5.7](https://online.stat.psu.edu/stat462/node/137/) | MLR parameter tests | @sec-f-test |
+| [6.1](https://online.stat.psu.edu/stat462/node/145/) | MLR model assumptions | @sec-mlr-assumptions |
+| [6.2](https://online.stat.psu.edu/stat462/node/146/) | Assessing the model assumptions | @sec-assessing |
+| [6.3](https://online.stat.psu.edu/stat462/node/147/) | Tests for error normality | @sec-normality-tests |
+| [6.4](https://online.stat.psu.edu/stat462/node/148/) | Tests for constant error variance | @sec-variance-tests |
+| [7.1](https://online.stat.psu.edu/stat462/node/152/) | Log-transforming only the predictor for SLR | @sec-log-predictor |
+| [7.4](https://online.stat.psu.edu/stat462/node/155/) | Other data transformations | @sec-other-transformations |
+| [7.6](https://online.stat.psu.edu/stat462/node/157/) | Interactions between quantitative predictors | @sec-interaction-concept |
+| [8.5](https://online.stat.psu.edu/stat462/node/164/) | Additive effects | @sec-additive |
+| [8.6](https://online.stat.psu.edu/stat462/node/165/) | Interaction effects | @sec-interaction-concept |
+
+## Journal articles
+
+Altman DG, Royston P. The cost of dichotomising continuous variables. *BMJ*. 2006;332(7549):1080. PMID: 16675816. doi: 10.1136/bmj.332.7549.1080.
+
+Appel LJ, Moore TJ, Obarzanek E, Vollmer WM, Svetkey LP, Sacks FM, et al.; DASH Collaborative Research Group. A clinical trial of the effects of dietary patterns on blood pressure. *New England Journal of Medicine*. 1997;336(16):1117–24. PMID: 9099655. doi: 10.1056/NEJM199704173361601.
+
+Doll S, Paccaud F, Bovet P, Burnier M, Wietlisbach V. Body mass index, abdominal adiposity and blood pressure: consistency of their association across developing and developed countries. *International Journal of Obesity and Related Metabolic Disorders*. 2002;26(1):48–57. PMID: 11791146. doi: 10.1038/sj.ijo.0801854.
+
+Kannel WB, Brand N, Skinner JJ Jr, Dawber TR, McNamara PM. The relation of adiposity to blood pressure and development of hypertension. The Framingham study. *Annals of Internal Medicine*. 1967;67(1):48–59. PMID: 6028658. doi: 10.7326/0003-4819-67-1-48.
+
+Law CM, Egger P, Dada O, Delgado H, Kylberg E, Lavin P, et al. Body size at birth and blood pressure among children in developing countries. *International Journal of Epidemiology*. 2001;30(1):52–7. PMID: 11171856. doi: 10.1093/ije/30.1.52.
+
+Levey AS, Stevens LA, Schmid CH, Zhang YL, Castro AF 3rd, Feldman HI, et al.; CKD-EPI (Chronic Kidney Disease Epidemiology Collaboration). A new equation to estimate glomerular filtration rate. *Annals of Internal Medicine*. 2009;150(9):604–12. PMID: 19414839. doi: 10.7326/0003-4819-150-9-200905050-00006.
+
+Porter AM. Misuse of correlation and regression in three medical journals. *Journal of the Royal Society of Medicine*. 1999;92(3):123–8. PMID: 10396255. doi: 10.1177/014107689909200306.
+
+Quanjer PH, Stanojevic S, Cole TJ, Baur X, Hall GL, Culver BH, et al. Multi-ethnic reference values for spirometry for the 3–95-yr age range: the global lung function 2012 equations. *European Respiratory Journal*. 2012;40(6):1324–43. PMID: 22743675. doi: 10.1183/09031936.00080312.
+
+Vickers AJ, Altman DG. Statistics notes: analysing controlled trials with baseline and follow up measurements. *BMJ*. 2001;323(7321):1123–4. PMID: 11701584. doi: 10.1136/bmj.323.7321.1123.
+
+## Software
+
+```{r}
+#| label: software
+r_ver <- paste0(R.version$major, ".", R.version$minor)
+pkg_ver <- function(p) as.character(utils::packageVersion(p))
+```
+
+All analyses in this chapter were performed in **R version `r r_ver`** (R Core Team, R Foundation for Statistical Computing, Vienna, Austria), and the document was produced with **Quarto**. The following packages were used:
+
+| Package | Version | Purpose in this chapter |
+|:-----|:-----|:---------------------------|
+| tidyverse | `r pkg_ver("tidyverse")` | Data manipulation and graphics |
+| readxl | `r pkg_ver("readxl")` | Reading the dataset |
+| janitor | `r pkg_ver("janitor")` | Cleaning variable names |
+| broom | `r pkg_ver("broom")` | Tidying model output |
+| gtsummary | `r pkg_ver("gtsummary")` | Descriptive and regression tables |
+| gt | `r pkg_ver("gt")` | Table formatting |
+| car | `r pkg_ver("car")` | Variance inflation factors, Levene's test |
+| lmtest | `r pkg_ver("lmtest")` | Breusch–Pagan test |
+| emmeans | `r pkg_ver("emmeans")` | Estimated marginal means and trends for interaction |
+| patchwork | `r pkg_ver("patchwork")` | Combining diagnostic figures |
+| MASS | `r pkg_ver("MASS")` | Box–Cox transformation |
+
+## Dataset
+
+The **Metabolic Syndrome Study for Malaysia (MSSM)** dataset used throughout this chapter is a community-based health survey of `r fmt(n_total, 0)` adults, held by the author. It is used here for teaching purposes. Body mass index and waist–hip ratio were derived from the recorded weight, height, waist circumference and hip circumference as described in @sec-derived; all other variables are as collected.
